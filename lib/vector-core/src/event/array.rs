@@ -19,13 +19,13 @@ use super::{
     EventRef, LogEvent, Metric, TraceEvent,
 };
 
-/// The type alias for an array of `LogEvent` elements.
+/// Type alias for an array of `LogEvent` elements.
 pub type LogArray = Vec<LogEvent>;
 
-/// The type alias for an array of `TraceEvent` elements.
+/// Type alias for an array of `TraceEvent` elements.
 pub type TraceArray = Vec<TraceEvent>;
 
-/// The type alias for an array of `Metric` elements.
+/// Type alias for an array of `Metric` elements.
 pub type MetricArray = Vec<Metric>;
 
 /// The core trait to abstract over any type that may work as an array
@@ -130,6 +130,28 @@ impl EventContainer for MetricArray {
 }
 
 /// An array of one of the `Event` variants exclusively.
+///
+/// # Why Homogeneous Arrays?
+///
+/// `EventArray` stores only one event type per batch. This improves performance and
+/// avoids accidental mixing of incompatible event kinds.
+///
+/// ## Performance Benefits
+///
+/// - Avoids per-event type checks in batch processing hot paths.
+/// - Improves batching/serialization efficiency for type-specific sinks.
+/// - Improves locality when processing similarly-shaped events together.
+///
+/// ## Type Safety
+///
+/// The variants are mutually exclusive: a batch contains logs, metrics, or traces.
+/// This is enforced by the enum, not by runtime checks.
+///
+/// # When to Use
+///
+/// - Batch processing many events of the same type.
+/// - Sending to type-specific sinks (for example, Prometheus/InfluxDB metrics sinks).
+/// - Aggregating same-type events from multiple inputs.
 #[derive(Clone, Debug, PartialEq)]
 pub enum EventArray {
     /// An array of type `LogEvent`
@@ -142,6 +164,8 @@ pub enum EventArray {
 
 impl EventArray {
     /// Iterate over references to this array's events.
+    ///
+    /// This returns `EventRef` values without cloning or converting events.
     pub fn iter_events(&self) -> impl Iterator<Item = EventRef<'_>> {
         match self {
             Self::Logs(array) => EventArrayIter::Logs(array.iter()),
@@ -151,6 +175,8 @@ impl EventArray {
     }
 
     /// Iterate over mutable references to this array's events.
+    ///
+    /// This returns `EventMutRef` values so callers can mutate events in place.
     pub fn iter_events_mut(&mut self) -> impl Iterator<Item = EventMutRef<'_>> {
         match self {
             Self::Logs(array) => EventArrayIterMut::Logs(array.iter_mut()),

@@ -52,23 +52,41 @@ macro_rules! metric_tags {
     };
 }
 
-/// A metric.
+/// Metric event implementation for typed numerical time-series data.
+///
+/// Metrics are structurally different from logs:
+/// - logs are flexible key-value objects;
+/// - metrics carry typed values (counter, gauge, histogram, etc.) with semantics;
+/// - metrics also carry series identity (name/namespace/tags), kind, and timing.
+///
+/// # Why an Enum of Value Types?
+///
+/// Different metric kinds are not interchangeable:
+/// counters accumulate, gauges represent the latest value, and histogram/distribution
+/// variants carry sample structures. An enum makes these constraints explicit.
 #[configurable_component]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Metric {
+    /// The series identifies this metric.
+    ///
+    /// A series consists of:
+    /// - `name`: The metric name (e.g., "http_requests")
+    /// - `namespace`: An optional grouping prefix (e.g., "vector")
+    /// - `tags`: Key-value labels for filtering and grouping (e.g., {"host": "web-1"})
     #[serde(flatten)]
     pub(super) series: MetricSeries,
 
+    /// The metric data (timestamp, value, kind).
     #[serde(flatten)]
     pub(super) data: MetricData,
 
-    /// Internal event metadata.
+    /// Internal event metadata (not serialized).
     #[serde(skip, default = "EventMetadata::default")]
     metadata: EventMetadata,
 }
 
 impl Metric {
-    /// Creates a new `Metric` with the given `name`, `kind`, and `value`.
+    /// Creates a new metric with the given `name`, `kind`, and `value`.
     pub fn new<T: Into<String>>(name: T, kind: MetricKind, value: MetricValue) -> Self {
         Self::new_with_metadata(name, kind, value, EventMetadata::default())
     }

@@ -78,34 +78,107 @@ static VECTOR_SOURCE_TYPE_PATH: LazyLock<Option<OwnedTargetPath>> = LazyLock::ne
 
 /// Internal representation of a log event.
 ///
-/// Uses `Arc` for cheap cloning. The size caches are invalidated
-/// whenever the event is mutated.
+/// # Why Arc-Based Copy-on-Write?
+///
+/// Log events are frequently cloned in Vector's topology:
+/// - When an event fans out to multiple sinks, each sink gets a clone
+/// - When a transform needs to modify an event, it works on a clone
+///
+/// Using `Arc<Inner>` provides cheap cloning - incrementing a reference count is much faster
+/// than deep-copying a potentially large nested map. When modification is needed, `Arc::make_mut`
+/// creates a private copy only for the mutator, while other references continue to share the original.
+///
+/// # Size Caching Strategy
+///
+/// Calculating event size is expensive (requires traversing the entire value tree). Events may have
+/// their size queried multiple times as they flow through the topology:
+/// - Buffer accounting (memory limits)
+/// - Throughput metrics (bytes/second)
+/// - Batch size decisions
+///
+/// We cache both:
+/// - `size_cache`: In-memory byte size (for buffer accounting)
+/// - `json_encoded_size_cache`: Estimated JSON size (for throughput metrics)
+///
+/// Caches are invalidated automatically when the event is mutated via `value_mut()`.
 #[derive(Debug, Deserialize)]
 struct Inner {
     /// The actual event data as a VRL Value (typically an Object).
+    ///
+    /// This is the user-visible data - the fields like "message", "host", "timestamp", etc.
+    /// It's stored as a `Value` enum which can be:
+    /// - `Object`: A map of key-value pairs (the common case)
+    /// - `Array`: A list of values
+    /// - `Bytes`, `Integer`, `Float`, `Boolean`, `Timestamp`, `Null`, `Regex`: Primitive types
+    ///
+    /// **Why BTreeMap?** The underlying `ObjectMap` is a `BTreeMap<KeyString, Value>`, which:
+    /// - Keeps keys sorted (useful for deterministic serialization)
+    /// - Provides O(log n) lookup
+    /// - Is more memory-efficient than HashMap for small maps
     #[serde(flatten)]
     fields: Value,
 
     /// Cached byte size for memory accounting.
+    ///
+    /// This stores the total in-memory size of the event, including:
+    /// - The Inner struct itself
+    /// - All heap-allocated data (strings, vectors, nested maps)
+    ///
+    /// Uses `AtomicCell` for lock-free concurrent reads. The cache is None initially
+    /// and is computed on first access.
     #[serde(skip)]
     size_cache: AtomicCell<Option<NonZeroUsize>>,
 
     /// Cached JSON-encoded size for serialization estimates.
+    ///
+    /// This estimates how many bytes the event will consume when serialized to JSON.
+    /// It's used for:
+    /// - Pre-allocating buffers in sinks
+    /// - Throughput metrics (bytes/second)
+    /// - Batch size decisions
+    ///
+    /// Note: This is an estimate, not exact. It approximates by summing field sizes without
+    /// actually serializing.
     #[serde(skip)]
     json_encoded_size_cache: AtomicCell<Option<NonZeroJsonSize>>,
 }
 
 impl Inner {
+    /// Invalidate both size caches.
+    ///
+    /// This must be called whenever the event data is about to be modified.
+    /// Without invalidation, cached sizes would be stale and lead to incorrect
+    /// buffer accounting and throughput metrics.
     fn invalidate(&self) {
         self.size_cache.store(None);
         self.json_encoded_size_cache.store(None);
     }
 
+    /// Get a reference to the inner Value.
+    ///
+    /// This returns the actual event data (the fields), not metadata.
     fn as_value(&self) -> &Value {
         &self.fields
     }
 }
 
+/// Calculate the total in-memory byte size.
+///
+/// # Caching Behavior
+///
+/// This uses lazy caching to avoid expensive recalculation:
+/// 1. First call: Traverses the entire value tree to calculate size
+/// 2. Subsequent calls: Return cached value (fast path)
+/// 3. After mutation: Cache is invalidated, recalculated on next access
+///
+/// # Size Calculation
+///
+/// The size includes:
+/// - `size_of::<Self>()`: The `Inner` struct storage
+/// - `self.allocated_bytes()`: All heap allocations (strings, vectors, nested maps)
+///
+/// **Why NonZeroUsize?** Size is always non-zero. `Option<NonZeroUsize>` can
+/// represent `None` without extra storage via Rust's niche optimization.
 impl ByteSizeOf for Inner {
     fn size_of(&self) -> usize {
         self.size_cache
@@ -128,6 +201,18 @@ impl ByteSizeOf for Inner {
     }
 }
 
+/// Estimate the JSON-encoded size for serialization planning.
+///
+/// This provides a fast approximation without actually serializing. The estimate
+/// is useful for:
+/// - Pre-allocating output buffers in sinks
+/// - Throughput metrics (bytes/second without serialization overhead)
+/// - Batch size decisions (when to flush based on size)
+///
+/// **Why Not Exact?** Actual serialization would:
+/// - Be expensive (defeating the purpose of caching)
+/// - Depend on JSON serializer settings (pretty print, etc.)
+/// The estimate is good enough for buffer allocation decisions.
 impl EstimatedJsonEncodedSizeOf for Inner {
     fn estimated_json_encoded_size_of(&self) -> JsonSize {
         self.json_encoded_size_cache
@@ -143,6 +228,15 @@ impl EstimatedJsonEncodedSizeOf for Inner {
     }
 }
 
+/// Clone implementation for use with `Arc::make_mut`.
+///
+/// # Why Not Copy Caches?
+///
+/// This clone is **only** called via `Arc::make_mut` when we need a mutable copy. At that point:
+/// - We're about to modify the data anyway (so caches will be invalidated)
+/// - Copying cached sizes would be wasted effort (they'd be wrong anyway after modification)
+///
+/// This optimization avoids atomic loads and allocations in the clone path.
 impl Clone for Inner {
     fn clone(&self) -> Self {
         Self {
@@ -160,6 +254,20 @@ impl Clone for Inner {
     }
 }
 
+/// Default Inner creates an empty log event.
+///
+/// # Why Value::Object?
+///
+/// **CRITICAL**: The default value **must** be `Value::Object` (an empty map), not `Value::Null`.
+///
+/// This is for backward compatibility with legacy code that expects:
+/// - `event.get("field")` to return `None` for missing fields (not panic)
+/// - `event.keys()` to return an iterator (not None)
+/// - Serialization to produce `{}` not `null`
+///
+/// Alternative approaches (rejected):
+/// - `Value::Null`: Would break field access patterns
+/// - `Value::Array`: Semantically wrong (log events are objects)
 impl Default for Inner {
     fn default() -> Self {
         Self {
@@ -188,18 +296,103 @@ impl PartialEq for Inner {
     }
 }
 
+/// The main log event structure - a flexible, schemaless key-value container.
+///
+/// # Architecture Overview
+///
+/// ```text
+/// LogEvent
+///   ├── inner: Arc<Inner>          ← Cheap cloning via Arc
+///   │    ├── fields: Value         ← User-visible event data
+///   │    ├── size_cache            ← Cached memory size
+///   │    └── json_encoded_size     ← Cached JSON size
+///   └── metadata: EventMetadata    ← Internal tracking (source, finalizers, schema)
+/// ```
+///
+/// # Copy-on-Write Semantics
+///
+/// When you clone a LogEvent, you get a new `Arc` reference to the same `Inner`:
+/// ```text
+/// Original:  Arc(refcount=1) → Inner { fields: {...} }
+/// Cloned:    Arc(refcount=2) ─┘ Inner { fields: {...} }  ← Same data!
+/// ```
+///
+/// When you mutate a cloned event, only then is the data copied:
+/// ```text
+/// Before mutation:
+///   Event A: Arc(refcount=2) → Inner { fields: {...} }
+///   Event B: Arc(refcount=2) ─┘ same Inner
+///
+/// After Event B mutates via value_mut():
+///   Event A: Arc(refcount=1) → Inner { fields: {...} }      ← Original
+///   Event B: Arc(refcount=1) → Inner { fields: {...modified} } ← Private copy
+/// ```
+///
+/// This makes fanout (sending one event to multiple sinks) cheap - no data copying
+/// until a sink actually modifies the event.
+///
+/// # Field Access Patterns
+///
+/// LogEvent supports multiple access patterns:
+///
+/// **Direct field access:**
+/// ```ignore
+/// let msg = event.get("message");  // Top-level field
+/// let host = event.get("host.name"); // Nested via path string
+/// ```
+///
+/// **Path-based access (more efficient):**
+/// ```ignore
+/// use lookup::path;
+/// let msg = event.get(path!("message"));  // Parsed at compile time
+/// let host = event.get(path!("host", "name"));  // Type-safe nested path
+/// ```
+///
+/// **Metadata access:**
+/// ```ignore
+/// // Metadata fields are prefixed with "%" or use PathPrefix::Metadata
+/// let source_type = event.get(metadata_path!("vector", "source_type"));
+/// ```
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct LogEvent {
+    /// The actual event data wrapped in Arc for cheap cloning.
+    /// See module-level documentation for copy-on-write semantics.
     #[serde(flatten)]
     inner: Arc<Inner>,
 
+    /// Internal metadata that travels with the event but is not user-visible.
+    ///
+    /// This includes:
+    /// - `source_id`: Which source created this event (for metrics)
+    /// - `source_type`: Type string (e.g., "kafka", "http")
+    /// - `finalizers`: Callbacks for delivery tracking
+    /// - `schema_definition`: Type information for fields
+    /// - `secrets`: Sensitive values (tokens, passwords) - never logged
+    /// - `datadog_api_key`, `splunk_hec_token`: Cached credentials
+    ///
+    /// Metadata is preserved through cloning and transforms, enabling end-to-end
+    /// acknowledgement from sources.
     #[serde(skip)]
     metadata: EventMetadata,
 }
 
 impl LogEvent {
-    /// This used to be the implementation for `LogEvent::from(&'str)`, but this is now only
-    /// valid for `LogNamespace::Legacy`
+    /// Create a log event from a string message (Legacy namespace only).
+    ///
+    /// # Legacy Behavior
+    ///
+    /// This method is for backward compatibility with the Legacy log namespace.
+    /// It automatically:
+    /// 1. Inserts the message into the configured message field (from global log_schema)
+    /// 2. Adds the current timestamp to the configured timestamp field (if configured)
+    ///
+    /// **For Vector namespace:** Construct events explicitly with `LogEvent::default()` and `insert()`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let event = LogEvent::from_str_legacy("Error: disk full");
+    /// // Creates: { "message": "Error: disk full", "timestamp": "2024-01-15T10:30:00Z" }
+    /// ```
     pub fn from_str_legacy(msg: impl Into<String>) -> Self {
         let mut log = LogEvent::default();
         log.maybe_insert(log_schema().message_key_target_path(), msg.into());
@@ -211,16 +404,37 @@ impl LogEvent {
         log
     }
 
-    /// This used to be the implementation for `LogEvent::from(Bytes)`, but this is now only
-    /// valid for `LogNamespace::Legacy`
+    /// Create a log event from raw bytes (Legacy namespace only).
+    ///
+    /// The bytes are converted to a UTF-8 string (with lossy conversion for invalid UTF-8).
+    /// This is for sources that read raw binary data that should be treated as text.
     pub fn from_bytes_legacy(msg: &Bytes) -> Self {
         Self::from_str_legacy(String::from_utf8_lossy(msg.as_ref()).to_string())
     }
 
+    /// Get an immutable reference to the event's Value.
+    ///
+    /// The Value is typically a `Value::Object` (a map), but could theoretically
+    /// be other Value variants (though this is rare).
+    ///
+    /// **Use this when:** You need to inspect the raw Value structure or pass it to VRL.
     pub fn value(&self) -> &Value {
         self.inner.as_ref().as_value()
     }
 
+    /// Get a mutable reference to the event's Value, triggering copy-on-write.
+    ///
+    /// # Copy-on-Write Behavior
+    ///
+    /// If this event is shared via Arc (refcount > 1), calling this method will:
+    /// 1. Clone the Inner data
+    /// 2. Invalidate size caches
+    /// 3. Return a mutable reference to the new private copy
+    ///
+    /// This ensures modifications don't affect other Arc references to the same event.
+    ///
+    /// **Performance note:** Only call this if you actually need to mutate.
+    /// Use `value()` for read-only access.
     pub fn value_mut(&mut self) -> &mut Value {
         let result = Arc::make_mut(&mut self.inner);
         // We MUST invalidate the inner size cache when making a
@@ -229,17 +443,34 @@ impl LogEvent {
         &mut result.fields
     }
 
+    /// Get an immutable reference to the event metadata.
     pub fn metadata(&self) -> &EventMetadata {
         &self.metadata
     }
 
+    /// Get a mutable reference to the event metadata.
+    ///
+    /// This does NOT trigger copy-on-write on the event data, only on metadata.
     pub fn metadata_mut(&mut self) -> &mut EventMetadata {
         &mut self.metadata
     }
 
-    /// This detects the log namespace used at runtime by checking for the existence
-    /// of the read-only "vector" metadata, which only exists (and is required to exist)
-    /// with the `Vector` log namespace.
+    /// Detect which log namespace this event is using at runtime.
+    ///
+    /// # Detection Method
+    ///
+    /// The namespace is detected by checking for the presence of the "vector" metadata
+    /// field, which exists only in the `Vector` namespace:
+    /// - `Vector` namespace: Has `%vector` metadata (e.g., `%vector.source_type`)
+    /// - `Legacy` namespace: No `%vector` metadata
+    ///
+    /// # Why Detection Matters
+    ///
+    /// Different namespaces have different field access patterns:
+    /// - `Legacy`: Fields like `source_type` are at the event root
+    /// - `Vector`: Fields like `source_type` are in the `%vector` metadata namespace
+    ///
+    /// Transforms and sinks need to know which namespace to use for field access.
     pub fn namespace(&self) -> LogNamespace {
         if self.contains((PathPrefix::Metadata, path!("vector"))) {
             LogNamespace::Vector
@@ -288,6 +519,10 @@ impl GetEventCountTags for LogEvent {
 }
 
 impl LogEvent {
+    /// Create a LogEvent with custom metadata.
+    ///
+    /// Use this when you need to preserve metadata from another event,
+    /// such as when transforming events while maintaining lineage tracking.
     #[must_use]
     pub fn new_with_metadata(metadata: EventMetadata) -> Self {
         Self {
@@ -296,7 +531,10 @@ impl LogEvent {
         }
     }
 
-    ///  Create a `LogEvent` from a `Value` and `EventMetadata`
+    /// Create a LogEvent from its components.
+    ///
+    /// This is the inverse of `into_parts()`. Use this when you have
+    /// a Value and Metadata and want to construct an event from them.
     pub fn from_parts(value: Value, metadata: EventMetadata) -> Self {
         Self {
             inner: Arc::new(value.into()),
@@ -304,15 +542,26 @@ impl LogEvent {
         }
     }
 
-    ///  Create a `LogEvent` from an `ObjectMap` and `EventMetadata`
+    /// Create a LogEvent from an ObjectMap and metadata.
+    ///
+    /// This is a convenience constructor for when you already have a map.
     pub fn from_map(map: ObjectMap, metadata: EventMetadata) -> Self {
         let inner = Arc::new(Inner::from(Value::Object(map)));
         Self { inner, metadata }
     }
 
-    /// Convert a `LogEvent` into a tuple of its components
+    /// Decompose a LogEvent into its components.
+    ///
+    /// This consumes the event and returns the Value and Metadata separately.
+    /// This is useful when:
+    /// - Converting events between types
+    /// - Extracting metadata for aggregation
+    /// - Serializing events
+    ///
+    /// **Note:** This triggers Arc::make_mut to ensure we own the data,
+    /// which invalidates caches and performs any necessary cloning.
     pub fn into_parts(mut self) -> (Value, EventMetadata) {
-        self.value_mut();
+        self.value_mut(); // Trigger Arc::make_mut to ensure ownership
 
         let value = Arc::try_unwrap(self.inner)
             .unwrap_or_else(|_| unreachable!("inner fields already cloned after owning"))
@@ -321,25 +570,42 @@ impl LogEvent {
         (value, metadata)
     }
 
+    /// Attach a batch notifier for delivery acknowledgement.
     #[must_use]
     pub fn with_batch_notifier(mut self, batch: &BatchNotifier) -> Self {
         self.metadata = self.metadata.with_batch_notifier(batch);
         self
     }
 
+    /// Optionally attach a batch notifier.
     #[must_use]
     pub fn with_batch_notifier_option(mut self, batch: &Option<BatchNotifier>) -> Self {
         self.metadata = self.metadata.with_batch_notifier_option(batch);
         self
     }
 
+    /// Add a finalizer to track this event's delivery status.
+    ///
+    /// Finalizers are used for end-to-end acknowledgement. When the event
+    /// is delivered (or fails), the finalizer is called back to notify
+    /// the source. This enables sources like Kafka to commit offsets
+    /// only after successful delivery.
     pub fn add_finalizer(&mut self, finalizer: EventFinalizer) {
         self.metadata.add_finalizer(finalizer);
     }
 
-    /// Parse the specified `path` and if there are no parsing errors, attempt to get a reference to a value.
+    /// Parse a path string and get the value at that path.
+    ///
     /// # Errors
-    /// Will return an error if path parsing failed.
+    ///
+    /// Returns an error if the path string cannot be parsed.
+    /// For example, invalid syntax like `field..name` would fail.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let value = event.parse_path_and_get_value("host.name")?;
+    /// ```
     pub fn parse_path_and_get_value(
         &self,
         path: impl AsRef<str>,
@@ -347,6 +613,18 @@ impl LogEvent {
         parse_target_path(path.as_ref()).map(|path| self.get(&path))
     }
 
+    /// Get a value from the event by path.
+    ///
+    /// This is the primary field access method. The path can target:
+    /// - Event fields: `event.get(event_path!("message"))`
+    /// - Metadata fields: `event.get(metadata_path!("vector", "source_type"))`
+    ///
+    /// # Path Prefixes
+    ///
+    /// - `PathPrefix::Event`: User-visible data fields
+    /// - `PathPrefix::Metadata`: Internal tracking fields (prefixed with "%")
+    ///
+    /// Returns `None` if the path doesn't exist.
     #[allow(clippy::needless_pass_by_value)] // TargetPath is always a reference
     pub fn get<'a>(&self, key: impl TargetPath<'a>) -> Option<&Value> {
         match key.prefix() {
@@ -355,10 +633,23 @@ impl LogEvent {
         }
     }
 
-    /// Retrieves the value of a field based on it's meaning.
-    /// This will first check if the value has previously been dropped. It is worth being
-    /// aware that if the field has been dropped and then somehow re-added, we still fetch
-    /// the dropped value here.
+    /// Get a value by its semantic meaning.
+    ///
+    /// # Semantic Meanings
+    ///
+    /// Semantic meanings are mappings from abstract concepts to concrete paths:
+    /// - "message" → Could map to "msg", "message", or "@message"
+    /// - "timestamp" → Could map to "timestamp", "time", or "@timestamp"
+    /// - "host" → Could map to "host", "hostname", or "@host"
+    ///
+    /// The schema definition contains these mappings. This method uses them
+    /// to find the right path and retrieve the value.
+    ///
+    /// # Dropped Field Handling
+    ///
+    /// If a field was dropped (e.g., by the `only_fields` transform) but its
+    /// value is still needed (e.g., for metrics tagging), it's stored in
+    /// `dropped_fields` in metadata. This method checks dropped fields first.
     pub fn get_by_meaning(&self, meaning: impl AsRef<str>) -> Option<&Value> {
         self.metadata().dropped_field(&meaning).or_else(|| {
             self.metadata()
