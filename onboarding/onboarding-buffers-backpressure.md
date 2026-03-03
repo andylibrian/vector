@@ -12,13 +12,143 @@ It answers:
 
 For unfamiliar terms, see the [Glossary](./glossary.md).
 
+## What Problem Do Buffers and Backpressure Solve? (Conceptual Background)
+
+### The speed mismatch problem
+
+In any pipeline, producers and consumers run at different speeds. A file source can read log lines at 500 MB/s, but an Elasticsearch sink might only ingest at 50 MB/s. Without buffering, either the source must slow down to match the sink (wasting source capacity), or events must be dropped (losing data).
+
+Buffers absorb temporary speed differences:
+
+```
+Source: 100,000 events/sec ──▸ [ Buffer: 500 events ] ──▸ Sink: 80,000 events/sec
+
+Second 1: buffer absorbs 20,000 excess events (20,000 in buffer)
+Second 2: buffer absorbs 20,000 more (40,000 in buffer)
+...
+Second 25: buffer is full (500,000 events)  ← now what?
+```
+
+When the buffer fills, something must give. This is where backpressure policy matters.
+
+### Backpressure: the domino effect
+
+With the `Block` policy (the default), a full buffer causes the upstream producer to pause. This pause propagates backwards through the entire pipeline like a chain reaction:
+
+```
+Elasticsearch is slow (5,000 events/sec instead of 80,000)
+    │
+    ▼
+Sink buffer fills up (500 events)
+    │
+    ▼
+Fanout blocks trying to send to the full buffer
+    │
+    ▼
+Transform can't emit output → stops pulling from its input
+    │
+    ▼
+Source's SourceSender blocks
+    │
+    ▼
+Source stops reading new data
+    │
+    ▼
+External system sees slow consumption:
+  - Kafka: consumer lag increases (messages queue in Kafka)
+  - File: tail position falls behind (logs queue on disk)
+  - HTTP: connection hangs (upstream retries or queues)
+```
+
+This is **intentional**. The alternative — continuing to consume at full speed — means either unbounded memory growth (eventually OOM-killed) or data loss (events dropped before delivery). Backpressure trades latency for reliability: events arrive late but they arrive.
+
+### Why two buffer types?
+
+**Memory buffers** store events as in-memory Rust objects. They're fast (no serialization, no disk I/O) but volatile — if Vector crashes, buffered events are lost:
+
+```
+Memory buffer:
+  ┌──────────────────────────────────────┐
+  │ EventArray EventArray EventArray ... │  ← Rust objects in heap memory
+  └──────────────────────────────────────┘
+  Capacity: 500 events (default)
+  Latency: microseconds
+  Durability: none (lost on crash)
+```
+
+**Disk buffers** serialize events to a write-ahead log on disk. They're slower but durable — events survive crashes and restarts:
+
+```
+Disk buffer:
+  ┌──────────────────────────────────────┐
+  │ /var/lib/vector/sinks/my_sink/       │
+  │   segment_0001.dat (serialized)      │  ← Events written to disk
+  │   segment_0002.dat                   │
+  └──────────────────────────────────────┘
+  Capacity: configurable bytes (e.g., 1 GB)
+  Latency: milliseconds
+  Durability: survives process crash
+```
+
+The choice depends on the use case. For metrics pipelines where losing a few data points is acceptable, memory buffers are ideal. For compliance logging where every event must be delivered, disk buffers provide the necessary durability.
+
+### The Overflow strategy: best of both worlds
+
+The `Overflow` policy chains two buffers — typically memory in front, disk behind:
+
+```
+Normal operation (sink keeping up):
+  Source ──▸ [Memory buffer: 200/500] ──▸ Sink
+              fast, low latency
+
+Spike (sink falling behind):
+  Source ──▸ [Memory buffer: 500/500 FULL] ──▸ overflow ──▸ [Disk buffer] ──▸ Sink
+              memory exhausted                                durable, slower
+
+Recovery (sink catches up):
+  Disk buffer drains ──▸ memory buffer has space again ──▸ back to normal
+```
+
+This gives you memory-speed performance during normal operation and disk durability during spikes. The events in the disk overflow are not lost if Vector crashes — they're recovered on restart.
+
+### Concrete capacity math
+
+Understanding the constants helps size buffers correctly:
+
+```
+SourceSender channel:
+  SOURCE_SENDER_BUFFER_SIZE = TRANSFORM_CONCURRENCY_LIMIT × CHUNK_SIZE
+  (capacity is in EventArray items, and depends on runtime worker thread count)
+
+Transform input channel:
+  TOPOLOGY_BUFFER_SIZE = 100 EventArray items
+
+Default memory buffer:
+  500 events
+
+Typical event size:
+  ~500 bytes (structured log with 10 fields)
+
+So a default memory buffer holds:
+  500 events × 500 bytes = ~250 KB
+
+With a disk buffer at 1 GB:
+  1,073,741,824 bytes / 500 bytes = ~2 million events
+
+Example (8 worker threads):
+  SOURCE_SENDER_BUFFER_SIZE = 8 × 1000 = 8000 EventArray items
+  Worst-case queued events in that channel = 8000 × 1000 = 8,000,000
+```
+
+This back-of-the-envelope math helps operators choose buffer sizes: if your Elasticsearch cluster goes down for 10 minutes and you ingest 100,000 events/sec, you need `100,000 × 600 × 500 bytes ≈ 30 GB` of disk buffer to avoid data loss. A 500-event memory sink buffer would fill in 5 milliseconds.
+
 ## Table of Contents
 
 - [Overview](#overview)
 - [Buffer Types](#buffer-types)
   - [Memory Buffer](#memory-buffer)
   - [Disk Buffer](#disk-buffer)
-- [WhenFull Policy](#when-full-policy)
+- [WhenFull Policy](#whenfull-policy)
 - [Channel Topology](#channel-topology)
 - [Backpressure Propagation](#backpressure-propagation)
 - [Acknowledgement Tracking](#acknowledgement-tracking)
@@ -117,13 +247,14 @@ Source ──▸ SourceSender channel ──▸ Fanout ──▸ Buffer channel 
 
 **SourceSender channel:**
 - Connects a source to its `Fanout`.
-- Bounded by `TOPOLOGY_BUFFER_SIZE` (100) event arrays.
+- Bounded by `SOURCE_SENDER_BUFFER_SIZE` event arrays, where `SOURCE_SENDER_BUFFER_SIZE = TRANSFORM_CONCURRENCY_LIMIT × CHUNK_SIZE`.
 - Batches events into arrays of `CHUNK_SIZE` (1000).
 
 **Buffer channel:**
-- Connects a Fanout output to a transform or sink input.
-- Bounded by the sink's buffer config (default 500 events for memory).
-- `BufferSender<EventArray>` / `BufferReceiver<EventArray>`.
+- Connects a Fanout output to a downstream transform or sink.
+- Transform input channels are bounded by `TOPOLOGY_BUFFER_SIZE` (100) event arrays.
+- Sink input channels are bounded by the sink's configured `buffer` settings (default memory: 500 events).
+- Uses `BufferSender<EventArray>` / `BufferReceiver<EventArray>`.
 
 **Fanout:**
 - Does not buffer — it distributes events synchronously to all connected consumers.
@@ -166,12 +297,12 @@ With `DropNewest`, step 3 drops the event instead of blocking, so backpressure d
 Buffers participate in the acknowledgement system:
 
 1. Events enter the buffer with their `EventFinalizers` intact.
-2. The buffer preserves finalizers through storage (memory or disk).
-3. When the sink reads events from the buffer, it extracts finalizers.
-4. The sink reports delivery status via the finalizers.
-5. The status propagates back to the source.
+2. Memory buffers preserve finalizers directly in memory.
+3. Disk buffers persist events and use internal batch notifiers/finalizers to track when records can be acknowledged and deleted.
+4. When the sink reads events from the buffer, it extracts finalizers and reports delivery status.
+5. The status propagates back upstream.
 
-For disk buffers, finalizer metadata is serialized alongside event data, so acknowledgements survive process restarts.
+For disk buffers, acknowledgement state is tracked by the buffer subsystem; original in-memory finalizer callbacks are not serialized as part of event payloads.
 
 ---
 
@@ -180,10 +311,9 @@ For disk buffers, finalizer metadata is serialized alongside event data, so ackn
 | Constant | Value | Location | Purpose |
 |----------|-------|----------|---------|
 | `CHUNK_SIZE` | 1000 | [`lib/vector-core/src/source_sender/mod.rs:20`](../lib/vector-core/src/source_sender/mod.rs#L20) | Events per batch in SourceSender |
-| `TOPOLOGY_BUFFER_SIZE` | 100 | `src/topology/builder.rs` | EventArray capacity of inter-component channels |
+| `SOURCE_SENDER_BUFFER_SIZE` | `TRANSFORM_CONCURRENCY_LIMIT × CHUNK_SIZE` | [`src/topology/builder.rs:62`](../src/topology/builder.rs#L62) | SourceSender channel capacity (EventArray items) |
+| `TOPOLOGY_BUFFER_SIZE` | 100 | [`src/topology/builder.rs:66`](../src/topology/builder.rs#L66) | Transform input channel capacity (EventArray items) |
 | Default memory buffer | 500 events | `lib/vector-buffers/src/config.rs` | Default buffer size when not configured |
-
-Effective capacity of the SourceSender channel: `TOPOLOGY_BUFFER_SIZE × CHUNK_SIZE` = 100,000 events.
 
 ---
 
@@ -206,9 +336,20 @@ sinks:
       type: disk
       max_size: 1073741824  # 1 GB max disk usage
       when_full: block
+
+  overflow_sink:
+    type: kafka
+    buffer:
+      - type: memory
+        max_events: 1000
+        when_full: overflow
+      - type: disk
+        max_size: 1073741824
+        when_full: block
 ```
 
 If no `buffer` section is specified, the default is a memory buffer with 500 events and `Block` policy.
+`when_full: overflow` is only valid when the buffer is chained and not on the final stage.
 
 ---
 

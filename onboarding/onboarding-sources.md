@@ -14,6 +14,110 @@ It answers:
 
 For unfamiliar terms, see the [Glossary](./glossary.md).
 
+## What Problem Do Sources Solve? (Conceptual Background)
+
+### The data ingestion challenge
+
+Observability data arrives in radically different ways. A file source must tail log files, detect rotation, and track read positions. An HTTP source must listen on a socket, parse requests, and return responses. A Kafka source must manage consumer groups, partition assignments, and offset commits. Each one involves different protocols, error handling, and lifecycle management.
+
+Without an abstraction, every component in Vector would need to understand every input mechanism. Sources solve this by providing a uniform contract: **regardless of how data arrives, a source converts it into `Event` values and pushes them through a `SourceSender` channel.** Everything downstream sees the same interface.
+
+```
+External world                       Vector pipeline
+──────────────                       ───────────────
+
+Nginx log file ──▸ [file source] ──┐
+HTTP POST      ──▸ [http source] ──┼──▸ SourceSender ──▸ Fanout ──▸ transforms/sinks
+Kafka topic    ──▸ [kafka source]──┘
+                                        (all produce Event values)
+```
+
+### The three source patterns
+
+Most of Vector's 47+ sources follow one of three patterns, each solving a different ingestion problem:
+
+**Polling sources** periodically fetch data. The source controls the timing:
+
+```
+┌──────────────────────────────────────────┐
+│  loop {                                  │
+│      sleep(interval)                     │
+│      data = collect_metrics()            │ ← Source pulls data
+│      out.send_batch(data)                │
+│  }                                       │
+└──────────────────────────────────────────┘
+Examples: internal_metrics, host_metrics, aws_s3
+```
+
+**Listening sources** accept incoming connections. The external system controls the timing:
+
+```
+┌──────────────────────────────────────────┐
+│  listener = bind(":8080")                │
+│  loop {                                  │
+│      conn = listener.accept()            │ ← External system pushes data
+│      spawn(handle_connection(conn, out)) │
+│  }                                       │
+└──────────────────────────────────────────┘
+Examples: http_server, socket, syslog
+```
+
+**Tailing sources** watch files for new data, tracking position across restarts:
+
+```
+┌──────────────────────────────────────────┐
+│  checkpoint = load_saved_position()      │
+│  loop {                                  │
+│      new_lines = read_from(checkpoint)   │ ← Hybrid: file grows externally,
+│      out.send_batch(new_lines)           │   source tracks position
+│      save_position(checkpoint)           │
+│  }                                       │
+└──────────────────────────────────────────┘
+Examples: file, journald, kubernetes_logs
+```
+
+### SourceSender: batching for throughput
+
+A naive source would send one event at a time through a channel. But channel operations have overhead — acquiring locks, waking the receiver, context switching. At high throughput (millions of events/second), per-event overhead dominates.
+
+`SourceSender` solves this by buffering events into arrays of 1000 (`CHUNK_SIZE`) before sending:
+
+```
+Source produces events one by one:
+  event1, event2, event3, ... event1000
+
+SourceSender batches them:
+  EventArray::Logs([event1, event2, ..., event1000])  ← one channel send for 1000 events
+
+Channel send:
+  1 send operation instead of 1000
+  ~1000x less channel overhead
+```
+
+This is similar to how network protocols batch small messages into larger frames, or how databases batch individual writes into WAL flushes. The batching is transparent to the source — it calls `send_event()` or `send_batch()` and `SourceSender` handles the accumulation.
+
+### Shutdown coordination: stopping without data loss
+
+Sources run as long-lived async tasks. When Vector shuts down, sources must stop cleanly — finish processing any in-progress data, flush their `SourceSender`, and exit. But they can't stop instantly if they're in the middle of reading a batch from Kafka or accepting an HTTP request.
+
+Each source receives a `ShutdownSignal` in its `SourceContext`. The source's main loop uses `tokio::select!` to race between "new data arrived" and "shutdown requested":
+
+```rust
+loop {
+    tokio::select! {
+        _ = &mut shutdown => {
+            // Stop accepting new data, flush remaining events
+            break;
+        }
+        data = get_next_data() => {
+            out.send_batch(parse(data)).await?;
+        }
+    }
+}
+```
+
+When the shutdown signal fires, the source exits its loop. This closes the `SourceSender` channel, which propagates through the topology — downstream buffers drain, transforms finish, and sinks write their remaining events. The entire pipeline drains in order, from source to sink.
+
 ## Table of Contents
 
 - [SourceConfig Trait](#sourceconfig-trait)
@@ -119,7 +223,7 @@ Key behaviors:
 
 - **Batching:** Events are buffered and sent as `EventArray` chunks of `CHUNK_SIZE` (1000 events, defined at [`lib/vector-core/src/source_sender/mod.rs:20`](../lib/vector-core/src/source_sender/mod.rs#L20)). This reduces per-event overhead.
 - **Backpressure:** `send_batch()` is async and will block when downstream buffers are full.
-- **Multiple outputs:** Sources with multiple named outputs can use `SourceSender::add_outputs()` to create separate channels for each.
+- **Multiple outputs:** Sources declare named outputs in `SourceConfig::outputs()`, then emit to them with `send_batch_named()`.
 - **Send timeout:** Configurable via `SourceConfig::send_timeout()`, returns an error if the channel is blocked for too long.
 
 Common send methods:

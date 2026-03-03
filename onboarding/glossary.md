@@ -50,7 +50,7 @@ This glossary defines terms used across the onboarding docs that may not be fami
 **Finalizer** — Part of the acknowledgement system. `EventFinalizer` instances are attached to events and report delivery status back to the source. When a sink successfully writes an event, it calls `finalizers.update_status(EventStatus::Delivered)`. See [Sinks: Acknowledgement Flow](./onboarding-sinks.md#acknowledgement-flow).
 
 <a id="function-transform"></a>
-**FunctionTransform** — The simplest transform trait. Processes one event at a time via `transform(&mut self, output: &mut OutputBuffer, event: Event)`. Suitable for stateless, per-event operations like filtering or field manipulation. Defined at [`lib/vector-core/src/transform/mod.rs:97`](../lib/vector-core/src/transform/mod.rs#L97). See [Transforms](./onboarding-transforms.md#function-transform).
+**FunctionTransform** — The simplest transform trait. Processes one event at a time via `transform(&mut self, output: &mut OutputBuffer, event: Event)`. Suitable for stateless, per-event operations like filtering or field manipulation. Defined at [`lib/vector-core/src/transform/mod.rs:97`](../lib/vector-core/src/transform/mod.rs#L97). See [Transforms](./onboarding-transforms.md#functiontransform).
 
 <a id="healthcheck"></a>
 **Healthcheck** — An async function that validates a sink's configuration at startup (e.g., by pinging the destination endpoint). Returns `Ok(())` on success or an error. Can be required via `--require-healthy` CLI flag. Part of the `SinkConfig::build()` return value.
@@ -74,7 +74,7 @@ This glossary defines terms used across the onboarding docs that may not be fami
 **OutputId** — A compound identifier for a specific output of a component, combining the `ComponentKey` and an optional output name (for components with multiple named outputs, like the `route` transform). Used to wire inputs to outputs in the topology graph.
 
 <a id="running-topology"></a>
-**RunningTopology** — The live, executing pipeline state. Holds task handles for all running components, buffer senders for inputs, control channels for fanout management, and the shutdown coordinator. Supports config reload by computing diffs and rewiring components. Defined at [`src/topology/running.rs:56`](../src/topology/running.rs#L56). See [Topology](./onboarding-topology.md#running-topology).
+**RunningTopology** — The live, executing pipeline state. Holds task handles for all running components, buffer senders for inputs, control channels for fanout management, and the shutdown coordinator. Supports config reload by computing diffs and rewiring components. Defined at [`src/topology/running.rs:56`](../src/topology/running.rs#L56). See [Topology](./onboarding-topology.md#runningtopology).
 
 <a id="schema-definition"></a>
 **SchemaDefinition** — A type-level description of an event's expected shape (field names, types, semantic meanings). Propagated through the topology from sources through transforms. Used for validation, documentation, and VRL type checking.
@@ -86,16 +86,16 @@ This glossary defines terms used across the onboarding docs that may not be fami
 **Source** — A component that ingests data from an external system and emits events into the pipeline. Implements `SourceConfig` for configuration and runs as an async task that sends events via `SourceSender`. See [Sources](./onboarding-sources.md).
 
 <a id="source-sender"></a>
-**SourceSender** — The channel interface that sources use to emit events into the pipeline. Batches events into `EventArray` chunks of `CHUNK_SIZE` (1000) for efficiency. Supports multiple named outputs. Provides backpressure when downstream consumers are slow. Defined at [`lib/vector-core/src/source_sender/sender.rs:93`](../lib/vector-core/src/source_sender/sender.rs#L93). See [Sources: SourceSender](./onboarding-sources.md#source-sender).
+**SourceSender** — The channel interface that sources use to emit events into the pipeline. Batches events into `EventArray` chunks of `CHUNK_SIZE` (1000) for efficiency. Supports multiple named outputs. Provides backpressure when downstream consumers are slow. Defined at [`lib/vector-core/src/source_sender/sender.rs:93`](../lib/vector-core/src/source_sender/sender.rs#L93). See [Sources: SourceSender](./onboarding-sources.md#sourcesender).
 
 <a id="stream-sink"></a>
-**StreamSink** — A sink trait that receives a `BoxStream` of events and runs until the stream ends. The most common sink implementation pattern. Defined at [`lib/vector-core/src/sink.rs:92`](../lib/vector-core/src/sink.rs#L92). See [Sinks: StreamSink](./onboarding-sinks.md#stream-sink).
+**StreamSink** — A sink trait that receives a `BoxStream` of events and runs until the stream ends. The most common sink implementation pattern. Defined at [`lib/vector-core/src/sink.rs:92`](../lib/vector-core/src/sink.rs#L92). See [Sinks: StreamSink](./onboarding-sinks.md#streamsink).
 
 <a id="sync-transform"></a>
-**SyncTransform** — A transform trait that can write to multiple named outputs via `TransformOutputs`. Used for routing transforms like `route` that send different events to different downstream paths. Defined at [`lib/vector-core/src/transform/mod.rs:137`](../lib/vector-core/src/transform/mod.rs#L137). See [Transforms](./onboarding-transforms.md#sync-transform).
+**SyncTransform** — A transform trait that can write to multiple named outputs via `TransformOutputsBuf` (`transform(&mut self, event: Event, output: &mut TransformOutputsBuf)`). Used for routing transforms like `route` that send different events to different downstream paths. Defined at [`lib/vector-core/src/transform/mod.rs:137`](../lib/vector-core/src/transform/mod.rs#L137). See [Transforms](./onboarding-transforms.md#synctransform).
 
 <a id="task-transform"></a>
-**TaskTransform** — An async transform trait that receives and returns a `BoxStream`. Suitable for transforms that need async coordination, internal buffering, or windowed aggregation. Runs as an independent Tokio task. Defined at [`lib/vector-core/src/transform/mod.rs:111`](../lib/vector-core/src/transform/mod.rs#L111). See [Transforms](./onboarding-transforms.md#task-transform).
+**TaskTransform** — An async transform trait that receives and returns a pinned stream (`Pin<Box<dyn Stream<...>>>`). Suitable for transforms that need async coordination, internal buffering, or windowed aggregation. Runs as an independent Tokio task. Defined at [`lib/vector-core/src/transform/mod.rs:111`](../lib/vector-core/src/transform/mod.rs#L111). See [Transforms](./onboarding-transforms.md#tasktransform).
 
 <a id="topology"></a>
 **Topology** — The directed acyclic graph (DAG) of sources, transforms, and sinks that defines Vector's data pipeline. Built from configuration, managed at runtime, and supports zero-downtime reload. See [Topology](./onboarding-topology.md).
@@ -104,10 +104,10 @@ This glossary defines terms used across the onboarding docs that may not be fami
 **Transform** — A component that processes events between sources and sinks. Can filter, modify, aggregate, or route events. Comes in three runtime variants: `Function` (simple per-event), `Synchronous` (multi-output), and `Task` (async streaming). Defined at [`lib/vector-core/src/transform/mod.rs:21`](../lib/vector-core/src/transform/mod.rs#L21). See [Transforms](./onboarding-transforms.md).
 
 <a id="vector-sink"></a>
-**VectorSink** — An enum wrapping the two sink execution models: `Sink` (Tower-based futures sink) and `Stream` (stream-based `StreamSink`). Returned by `SinkConfig::build()`. Defined at [`lib/vector-core/src/sink.rs:10`](../lib/vector-core/src/sink.rs#L10). See [Sinks: VectorSink](./onboarding-sinks.md#vector-sink).
+**VectorSink** — An enum wrapping the two sink execution models: `Sink` (Tower-based futures sink) and `Stream` (stream-based `StreamSink`). Returned by `SinkConfig::build()`. Defined at [`lib/vector-core/src/sink.rs:10`](../lib/vector-core/src/sink.rs#L10). See [Sinks: VectorSink](./onboarding-sinks.md#vectorsink).
 
 <a id="vrl"></a>
 **VRL** (Vector Remap Language) — A purpose-built expression language for transforming observability data. Used primarily in the `remap` transform. Compiles to an AST that is evaluated per-event. Type-safe, with no I/O or side effects. See the `remap` transform at [`src/transforms/remap.rs:59`](../src/transforms/remap.rs#L59).
 
 <a id="when-full"></a>
-**WhenFull** — The backpressure policy for buffers. `Block` pauses the upstream producer until space is available (default). `DropNewest` discards incoming events when the buffer is full. Configured per-sink in the `buffer` section. Defined at [`lib/vector-buffers/src/lib.rs:45`](../lib/vector-buffers/src/lib.rs#L45). See [Buffers & Backpressure](./onboarding-buffers-backpressure.md#when-full-policy).
+**WhenFull** — The backpressure policy for buffers. `Block` pauses the upstream producer until space is available (default). `DropNewest` discards incoming events when the buffer is full. `Overflow` passes events to the next stage in a chained buffer topology. Configured per-sink in the `buffer` section. Defined at [`lib/vector-buffers/src/lib.rs:45`](../lib/vector-buffers/src/lib.rs#L45). See [Buffers & Backpressure](./onboarding-buffers-backpressure.md#whenfull-policy).

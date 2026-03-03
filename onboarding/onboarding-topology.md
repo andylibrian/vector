@@ -13,6 +13,120 @@ It answers:
 
 For unfamiliar terms, see the [Glossary](./glossary.md).
 
+## What Problem Does the Topology System Solve? (Conceptual Background)
+
+### From config to running tasks
+
+A config file describes a graph of components. But a YAML file doesn't process data — you need running async tasks connected by channels. The topology system bridges this gap: it takes a validated `Config`, constructs every component as a Tokio task, wires them together with buffered channels and fanouts, and manages their lifecycle (start, reload, shutdown).
+
+Consider this simple pipeline:
+
+```yaml
+sources:
+  logs:
+    type: demo_logs
+transforms:
+  filter:
+    type: filter
+    inputs: [logs]
+    condition: '.level == "error"'
+sinks:
+  out:
+    type: console
+    inputs: [filter]
+```
+
+The topology builder turns this into:
+
+```
+Tokio task: demo_logs_source()
+    │
+    ▼
+SourceSender channel (bounded by SOURCE_SENDER_BUFFER_SIZE EventArray items)
+    │
+    ▼
+Fanout (distributes to 1 consumer)
+    │
+    ▼
+Transform input channel (bounded by TOPOLOGY_BUFFER_SIZE EventArray items)
+    │
+    ▼
+Inline processing: filter.transform(event) ──▸ OutputBuffer
+    │
+    ▼
+Sink buffer (configured per sink, default memory max_events = 500)
+    │
+    ▼
+Tokio task: console_sink.run()
+```
+
+Each arrow is a bounded async channel. When the console sink is slow (e.g., stdout is piped to a slow process), its buffer fills up, which blocks the filter, which blocks the fanout, which blocks the source. This is backpressure — and it emerges naturally from the channel wiring, not from explicit flow control code.
+
+### Why Fanout exists: the one-to-many routing problem
+
+A source might feed multiple transforms and sinks. Without Fanout, you'd need a separate copy of the source for each consumer, or complex multiplexing logic inside the source. Fanout solves this cleanly:
+
+```
+Source ──▸ Fanout ──▸ Transform A
+                  ├──▸ Transform B
+                  └──▸ Sink C
+```
+
+Fanout clones each event and sends it to every consumer. It uses `Arc`-based copy-on-write on `LogEvent` (see [Event Model](./onboarding-event-model.md)), so if none of the consumers modify the event, no data is actually copied — they all share the same `Arc<Inner>`.
+
+Critically, Fanout is also the mechanism for **zero-downtime reload**. Each Fanout has a control channel that accepts `Add`, `Remove`, `Pause`, and `Replace` messages. During a config reload, the topology can dynamically connect new consumers or disconnect old ones while the source keeps running:
+
+```
+Before reload:  Source ──▸ Fanout ──▸ Sink A
+                                  └──▸ Sink B
+
+Config change: remove Sink B, add Sink C
+
+During reload:  Fanout receives ControlMessage::Remove(B)
+                Fanout receives ControlMessage::Add(C)
+
+After reload:   Source ──▸ Fanout ──▸ Sink A
+                                  └──▸ Sink C
+```
+
+The source never stops, and Sink A never sees an interruption.
+
+### Graceful shutdown: draining without data loss
+
+When Vector receives SIGTERM, it can't just kill all tasks — events in flight would be lost. Instead, the topology performs an orderly drain:
+
+```
+Step 1: Signal sources to stop         Sources finish current work, close SourceSender
+Step 2: Channels drain                  Buffered events flow through transforms
+Step 3: Transforms finish               Output channels close
+Step 4: Sinks finish                    Write remaining events, report acknowledgements
+Step 5: All tasks exit                  Process terminates cleanly
+```
+
+This is like closing a water pipeline: you shut the valve at the source and let the remaining water flow through to the end before disconnecting the pipes. The shutdown timeout (default 60 seconds) ensures the process eventually exits even if a sink is stuck.
+
+### Config reload: the diff-and-rewire strategy
+
+Full restarts are expensive and lose in-flight data. Vector avoids this by treating config changes as graph mutations:
+
+```
+Old graph: A ──▸ X ──▸ P
+           B ──▸ Y ──▸ Q
+
+New graph: A ──▸ X ──▸ P
+           B ──▸ Y'──▸ Q    (Y changed config)
+           C ──▸ Z ──▸ R    (new components)
+
+Operations:
+  1. Build Y' and Z, R, C (new/changed components)
+  2. Stop Y (changed) — drain its buffers
+  3. Rewire: disconnect Y from fanout, connect Y' in its place
+  4. Start C, Z, R (new components)
+  5. A, X, P, B, Q keep running untouched
+```
+
+If building Y' fails (e.g., invalid VRL program), the entire reload is rolled back — Y continues running with the old config, and an error event is emitted. This makes config changes safe to experiment with in production.
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -20,7 +134,7 @@ For unfamiliar terms, see the [Glossary](./glossary.md).
   - [Builder Struct](#builder-struct)
   - [Build Phases](#build-phases)
   - [TopologyPieces](#topologypieces)
-- [RunningTopology](#running-topology)
+- [RunningTopology](#runningtopology)
   - [Task Management](#task-management)
   - [Inputs and Outputs](#inputs-and-outputs)
 - [Fanout and Control Channels](#fanout-and-control-channels)

@@ -7,20 +7,116 @@ It answers:
 - What traits a transform must implement
 - The three runtime variants (FunctionTransform, SyncTransform, TaskTransform) and when to use each
 - How TransformContext provides schema and enrichment data
-- How multi-output transforms work (OutputBuffer, TransformOutputs)
+- How multi-output transforms work (OutputBuffer, TransformOutputsBuf)
 - How concurrency is controlled
 - Walkthroughs of `filter` (simple) and `remap` (complex) transforms
 
 For unfamiliar terms, see the [Glossary](./glossary.md).
+
+## What Problem Do Transforms Solve? (Conceptual Background)
+
+### Processing data in flight
+
+Raw observability data is rarely in the right shape for its destination. Log messages need parsing, sensitive fields need redacting, metrics need aggregating, and events need routing to different sinks based on their content. Doing this processing at the source (application code) couples your applications to your observability infrastructure. Doing it at the destination wastes network bandwidth shipping data that will be filtered or transformed.
+
+Transforms sit between sources and sinks, processing data in flight:
+
+```
+Source: raw syslog lines
+    │
+    ▼
+Transform (remap): parse syslog → structured fields, add geo-IP enrichment
+    │
+    ▼
+Transform (filter): drop debug-level events
+    │
+    ▼
+Transform (route): errors → PagerDuty, everything → Elasticsearch
+    │
+    ├──▸ Sink: PagerDuty (errors only)
+    └──▸ Sink: Elasticsearch (all remaining)
+```
+
+This pipeline reduces Elasticsearch storage costs (debug events are dropped), adds enrichment data (geo-IP) without application changes, and routes alerts to PagerDuty — all configured in YAML, with zero code changes to the applications.
+
+### Why three transform types?
+
+Not all processing fits the same execution model. Consider three concrete examples:
+
+**Example 1: Filtering events** — A `filter` transform evaluates a condition on each event and either passes it through or drops it. It needs no state, no async I/O, and no buffering. It processes one event at a time, synchronously. This is a `FunctionTransform`.
+
+```
+Input:  event{level="debug"} → evaluate condition → drop (no output)
+Input:  event{level="error"} → evaluate condition → pass through
+```
+
+**Example 2: Routing to multiple outputs** — A `route` transform inspects each event and sends it to one of several named outputs based on conditions. It needs the ability to write to different output channels, but still processes one event at a time. This is a `SyncTransform`.
+
+```
+Input:  event{status=500} → condition matches "errors" → push to output "errors"
+Input:  event{status=200} → no condition matches       → push to default output
+```
+
+**Example 3: Aggregating metrics over time** — An `aggregate` transform collects metrics over a time window and emits combined results periodically. It must buffer events internally, manage timers, and flush asynchronously. It can't process events one at a time — it needs the full input stream. This is a `TaskTransform`.
+
+```
+Input stream:  metric{name="requests", value=1}, metric{name="requests", value=1}, ...
+               (accumulate for 10 seconds)
+Output:        metric{name="requests", value=1547}  ← emitted every 10 seconds
+```
+
+The three trait variants (`FunctionTransform`, `SyncTransform`, `TaskTransform`) correspond directly to these execution models. Using the simplest variant that fits your use case gives the topology builder maximum flexibility — `FunctionTransform` can be inlined into the pipeline loop and parallelized, while `TaskTransform` must run as an independent Tokio task.
+
+### How transforms fit in the pipeline
+
+The topology builder wraps each transform variant differently:
+
+```
+FunctionTransform / SyncTransform:
+  ┌──────────────────────────────────────────────────────┐
+  │  loop {                                              │
+  │      events = input_channel.recv()                   │
+  │      for event in events {                           │
+  │          transform.transform(&mut output, event)     │ ← Inlined in the loop
+  │      }                                               │
+  │      output_channel.send(output.drain())             │
+  │  }                                                   │
+  └──────────────────────────────────────────────────────┘
+  (runs inside the pipeline's event-processing loop, not as a separate task)
+
+TaskTransform:
+  ┌──────────────────────────────────────────────────────┐
+  │  output_stream = transform.transform(input_stream)   │ ← Separate Tokio task
+  │  // The transform owns the stream and controls       │
+  │  // when and how events are emitted                  │
+  └──────────────────────────────────────────────────────┘
+```
+
+For `FunctionTransform` with `enable_concurrency() = true`, the topology can spawn multiple worker tasks that pull from the same input and process events in parallel — useful for CPU-bound transforms where ordering doesn't matter.
+
+### OutputBuffer vs TransformOutputsBuf
+
+These two types control where processed events go:
+
+```
+FunctionTransform uses OutputBuffer:
+  output.push(event)     ← Events go to the single default output
+
+SyncTransform uses TransformOutputsBuf:
+  output.push(None, event)            ← Events go to default output
+  output.push(Some("errors"), event)  ← Events go to the named "errors" output
+```
+
+Named outputs create separate downstream paths in the topology graph. A transform with outputs `["default", "errors"]` creates two Fanouts, and downstream components can subscribe to either. This is how the `route` transform sends different events to different sinks without intermediate channels.
 
 ## Table of Contents
 
 - [TransformConfig Trait](#transformconfig-trait)
 - [TransformContext](#transformcontext)
 - [Transform Enum](#transform-enum)
-- [FunctionTransform](#function-transform)
-- [SyncTransform](#sync-transform)
-- [TaskTransform](#task-transform)
+- [FunctionTransform](#functiontransform)
+- [SyncTransform](#synctransform)
+- [TaskTransform](#tasktransform)
 - [Choosing a Transform Type](#choosing-a-transform-type)
 - [Concurrency](#concurrency)
 - [Walkthrough: filter Transform](#walkthrough-filter-transform)
@@ -138,12 +234,12 @@ Multi-output capable transform. Defined at [`lib/vector-core/src/transform/mod.r
 
 ```rust
 pub trait SyncTransform: Send + DynClone + Sync {
-    fn transform(&mut self, output: &mut TransformOutputs, event: Event);
+    fn transform(&mut self, event: Event, output: &mut TransformOutputsBuf);
 }
 ```
 
-- Like `FunctionTransform`, but receives `TransformOutputs` instead of `OutputBuffer`.
-- `TransformOutputs` allows writing to **named outputs** (e.g., `output.push_named("errors", event)`).
+- Like `FunctionTransform`, but receives `TransformOutputsBuf` instead of `OutputBuffer`.
+- `TransformOutputsBuf` allows writing to **named outputs** (e.g., `output.push(Some("errors"), event)`).
 - Used by routing transforms that send different events to different downstream paths.
 
 Best for: `route`, `swimlanes`, or any transform that needs multiple output channels.
@@ -155,7 +251,7 @@ Best for: `route`, `swimlanes`, or any transform that needs multiple output chan
 Async streaming transform. Defined at [`lib/vector-core/src/transform/mod.rs:111`](../lib/vector-core/src/transform/mod.rs#L111):
 
 ```rust
-pub trait TaskTransform<T: Send + 'static>: Send {
+pub trait TaskTransform<T: EventContainer + 'static>: Send + 'static {
     fn transform(
         self: Box<Self>,
         task_transform_input: Pin<Box<dyn Stream<Item = T> + Send>>,
@@ -215,7 +311,7 @@ pub struct FilterConfig {
 impl TransformConfig for FilterConfig {
     async fn build(&self, context: &TransformContext) -> crate::Result<Transform> {
         Ok(Transform::function(Filter::new(
-            self.condition.build(&context.enrichment_tables, context.merged_schema_definition.clone())?,
+            self.condition.build(&context.enrichment_tables, &context.metrics_storage)?,
         )))
     }
 

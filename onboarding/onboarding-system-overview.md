@@ -11,6 +11,90 @@ It answers:
 
 For unfamiliar terms (Event, Topology, Fanout, VRL, etc.), see the [Glossary](./glossary.md).
 
+## What Problem Does Vector Solve? (Conceptual Background)
+
+### The observability plumbing problem
+
+Every production system generates observability data — logs from application servers, metrics from infrastructure, traces from distributed services. This data needs to reach the right destinations: logs to Elasticsearch, metrics to Prometheus, traces to Jaeger. Without a pipeline, each application connects directly to each destination:
+
+```
+App A ──▸ Elasticsearch
+App A ──▸ Prometheus
+App A ──▸ S3 (archive)
+App B ──▸ Elasticsearch
+App B ──▸ Prometheus
+App B ──▸ S3 (archive)
+App C ──▸ Elasticsearch
+App C ──▸ Prometheus
+App C ──▸ S3 (archive)
+```
+
+With 10 applications and 5 destinations, you have 50 point-to-point connections. Each one needs its own retry logic, buffering, authentication, and format conversion. Adding a new destination means changing every application.
+
+### How a data pipeline solves this
+
+A pipeline like Vector acts as a single intermediary. Applications send data to Vector, and Vector handles routing, transformation, and delivery:
+
+```
+App A ─┐                       ┌──▸ Elasticsearch
+App B ─┼──▸ [ Vector ] ──▸ ────┼──▸ Prometheus
+App C ─┘                       └──▸ S3
+```
+
+Now there are only `N + M` connections instead of `N × M`. Adding a destination means changing one Vector config file, not every application.
+
+### Why not just use Logstash, Fluentd, or a cloud service?
+
+Vector differentiates itself in three ways:
+
+1. **Single binary, all data types.** Most pipeline tools handle only logs, or only metrics. Vector handles logs, metrics, and traces in a single binary with a unified event model. A Kafka message, a syslog line, and a Prometheus scrape all become `Event` values flowing through the same pipeline.
+
+2. **Backpressure-aware.** If Elasticsearch is slow, Vector doesn't silently drop data. Its buffer-and-backpressure system slows down ingestion gracefully, or overflows to disk, depending on configuration. This is the difference between "we lost 2 hours of logs during the outage" and "logs arrived 5 minutes late."
+
+3. **Zero-downtime reload.** Changing the pipeline config doesn't restart the process. Vector computes a diff between old and new configs, stops only changed components, starts new ones, and rewires the live graph — while unchanged components keep running without losing a single event.
+
+### The pipeline as a DAG
+
+Internally, Vector models the pipeline as a directed acyclic graph (DAG). Consider this configuration:
+
+```yaml
+sources:
+  app_logs:
+    type: file
+    include: ["/var/log/app/*.log"]
+
+transforms:
+  parse:
+    type: remap
+    inputs: [app_logs]
+    source: '. = parse_json!(.message)'
+
+  route:
+    type: route
+    inputs: [parse]
+    route:
+      errors: '.level == "error"'
+
+sinks:
+  all_logs:
+    type: elasticsearch
+    inputs: [parse]
+
+  error_alerts:
+    type: http
+    inputs: ["route.errors"]
+```
+
+This produces the following graph:
+
+```
+                                    ┌──▸ all_logs (Elasticsearch)
+app_logs ──▸ parse ──▸ route ──────┤
+                                    └──▸ error_alerts (HTTP webhook)
+```
+
+Every arrow is an async channel with a buffer. Every node is a Tokio task. The topology system builds this graph from config, manages its lifecycle, and can rewire it at runtime. Understanding this mental model — config → DAG → async tasks connected by buffered channels — is the key to understanding everything else in Vector.
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -47,7 +131,7 @@ All I/O is async, powered by the Tokio runtime. Components run as isolated async
 | Component | Responsibility | Key Entry Points |
 |-----------|----------------|------------------|
 | `src/app.rs` | Application lifecycle: build runtime, load config, start topology, handle signals | [`Application`](../src/app.rs#L54), [`StartedApplication::run`](../src/app.rs#L291) |
-| `src/config/` | Configuration loading, validation, schema generation, hot reload watcher | [`Config`](../src/config/mod.rs#L148), [`ConfigBuilder`](../src/config/builder.rs#L18), [`load_from_paths`](../src/config/loading/mod.rs#L127) |
+| `src/config/` | Configuration loading, validation, schema generation, hot reload watcher | [`Config`](../src/config/mod.rs#L148), [`ConfigBuilder`](../src/config/builder.rs#L18), [`load_from_paths_with_provider_and_secrets`](../src/config/loading/mod.rs#L146) |
 | `src/topology/` | Component graph construction, live management, zero-downtime reload | [`Builder`](../src/topology/builder.rs#L77), [`RunningTopology`](../src/topology/running.rs#L56), [`ReloadOutcome`](../src/topology/controller.rs#L56) |
 | `src/sources/` | 47+ data ingestion components | [`SourceConfig`](../src/config/source.rs#L86), [`SourceContext`](../src/config/source.rs#L134) |
 | `src/transforms/` | 20+ data processing components | [`TransformConfig`](../src/config/transform.rs#L198), [`Transform`](../lib/vector-core/src/transform/mod.rs#L21) |
@@ -98,7 +182,7 @@ Entry point: [`src/main.rs:48`](../src/main.rs#L48) → [`Application::run`](../
 1. Parse CLI arguments via `clap` in [`src/cli.rs`](../src/cli.rs).
 2. Build Tokio runtime with configurable worker threads in [`Application::prepare_from_opts`](../src/app.rs#L195).
 3. Initialize logging and telemetry.
-4. Load configuration from files/directories via [`load_from_paths`](../src/config/loading/mod.rs#L127).
+4. Load configuration from files/directories via [`load_from_paths_with_provider_and_secrets`](../src/config/loading/mod.rs#L146).
 5. Validate config and build topology via [`RunningTopology::start_init_validated`](../src/topology/running.rs#L1263).
 6. Start API server (if enabled via `--api`).
 7. Transition to `StartedApplication` and enter main event loop.
@@ -126,7 +210,7 @@ In [`StartedApplication::run`](../src/app.rs#L291):
 **Loading pipeline:**
 
 1. Config files (YAML, JSON, or TOML) are discovered via `--config` paths.
-2. Files are parsed and merged into a [`ConfigBuilder`](../src/config/builder.rs#L18) via [`load_from_paths`](../src/config/loading/mod.rs#L127).
+2. Files are parsed and merged into a [`ConfigBuilder`](../src/config/builder.rs#L18) as part of [`load_from_paths_with_provider_and_secrets`](../src/config/loading/mod.rs#L146).
 3. Environment variables are interpolated (unless disabled).
 4. Secret backends are resolved.
 5. `ConfigBuilder` is validated and converted to [`Config`](../src/config/mod.rs#L148).

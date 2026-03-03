@@ -12,6 +12,106 @@ It answers:
 
 For unfamiliar terms, see the [Glossary](./glossary.md).
 
+## What Problem Does the Codec System Solve? (Conceptual Background)
+
+### The format explosion problem
+
+Vector has 47+ sources and 56+ sinks, each potentially dealing with different data formats. A syslog source receives RFC 5424 messages. An HTTP source might receive JSON, Protobuf, or plain text. A Kafka source can receive anything — the format depends on the producer.
+
+Without a composable codec system, each source and sink would contain its own parsing and serialization code. Adding a new format would mean modifying every component. With 100+ components and 15+ formats, that's thousands of format-specific code paths.
+
+### The two-layer insight: framing and format are independent
+
+The key insight is that byte stream handling has two orthogonal concerns:
+
+1. **Framing** — "Where does one message end and the next begin?"
+2. **Format** — "What does each message mean?"
+
+These are independent. Newline-delimited JSON and newline-delimited syslog use the same framing (split on `\n`) but different formats. Length-prefixed JSON and length-prefixed Protobuf use the same framing (read 4-byte length, then that many bytes) but different formats.
+
+By separating them, Vector can mix and match:
+
+```
+Framing              Format              Result
+───────              ──────              ──────
+Newline-delimited  × JSON             = NDJSON (very common)
+Newline-delimited  × Syslog           = syslog-over-TCP
+Length-prefixed    × Protobuf         = gRPC-style binary protocol
+Newline-delimited  × Bytes (raw)      = plain log lines
+Octet-counting     × Syslog           = RFC 5425 syslog
+Character('\0')    × JSON             = null-delimited JSON
+```
+
+Adding a new format (e.g., CBOR) means implementing one deserializer and one serializer. It immediately works with all 7 framing types, giving 7 new combinations for free. Adding a new framing type gives it access to all 15+ formats.
+
+### How decoding works: a concrete example
+
+Consider a TCP source receiving newline-delimited JSON logs:
+
+```
+Raw bytes on the wire:
+  b'{"level":"info","msg":"request started"}\n{"level":"error","msg":"disk full"}\n'
+
+Step 1 — Framing (NewlineDelimitedDecoder):
+  Split on \n:
+    message1: b'{"level":"info","msg":"request started"}'
+    message2: b'{"level":"error","msg":"disk full"}'
+
+Step 2 — Format (JsonDeserializer):
+  Parse JSON into LogEvent:
+    event1: LogEvent { "level": "info",  "msg": "request started" }
+    event2: LogEvent { "level": "error", "msg": "disk full" }
+```
+
+Now consider the same source receiving length-prefixed Protobuf instead. The source code doesn't change — only the config:
+
+```yaml
+# Before                              # After
+decoding:                              decoding:
+  codec: json                            codec: protobuf
+framing:                                 schema: my_schema.proto
+  method: newline_delimited            framing:
+                                         method: length_delimited
+```
+
+The source's main loop doesn't care — it calls `decoder.decode(bytes)` and gets `Event` values either way. The decoder is constructed from config at build time, and the source treats it as a black box.
+
+### How encoding works: the three-stage pipeline
+
+Sinks encode events to bytes through three stages, each handling a distinct concern:
+
+```
+Input event:
+  { "message": "disk full", "host": "web-1", "password": "secret", "timestamp": "2024-01-15T10:30:00Z" }
+
+Stage 1 — Transformer (configured by user):
+  encoding.except_fields: ["password"]
+  encoding.timestamp_format: unix
+  Result: { "message": "disk full", "host": "web-1", "timestamp": 1705312200 }
+
+Stage 2 — Serializer (JSON):
+  Result: b'{"message":"disk full","host":"web-1","timestamp":1705312200}'
+
+Stage 3 — Framer (newline-delimited):
+  Result: b'{"message":"disk full","host":"web-1","timestamp":1705312200}\n'
+```
+
+The Transformer stage is crucial for data governance. It lets operators strip sensitive fields, control timestamp formats, and select specific fields — all without modifying application code or writing VRL transforms. A single `except_fields: ["password", "ssn", "credit_card"]` in the sink config prevents sensitive data from reaching the destination.
+
+### Why `Decoder` implements `tokio_util::codec::Decoder`
+
+Many sources read from TCP/UDP sockets using Tokio's `Framed` adapter, which wraps an `AsyncRead` stream with a codec. By implementing the standard `tokio_util::codec::Decoder` trait, Vector's `Decoder` plugs directly into Tokio's streaming infrastructure:
+
+```rust
+let framed = FramedRead::new(tcp_stream, decoder);
+while let Some(result) = framed.next().await {
+    let (events, byte_size) = result?;
+    out.send_batch(events).await?;
+}
+```
+
+This single pattern handles all framing and format combinations. The `Framed` adapter manages the internal byte buffer, calling the decoder whenever new bytes arrive. The decoder extracts one message via the framing layer, parses it via the format layer, and returns the resulting events. No source needs to manage byte buffers or partial reads manually.
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -97,12 +197,15 @@ Convert message bytes to events. Located in [`lib/codecs/src/decoding/format/`](
 | `BytesDeserializer` | Raw bytes | Single LogEvent with `message` field |
 | `JsonDeserializer` | JSON object | LogEvent with parsed fields |
 | `NativeJsonDeserializer` | Vector's native JSON format | Preserves Event type (Log/Metric/Trace) |
-| `SyslogDeserializer` | RFC 3164/5424 syslog | LogEvent with structured syslog fields |
+| `SyslogDeserializer`* | RFC 3164/5424 syslog | LogEvent with structured syslog fields |
 | `GelfDeserializer` | GELF JSON | LogEvent with GELF fields |
 | `ProtobufDeserializer` | Protocol Buffers | LogEvent from protobuf message |
-| `OtlpDeserializer` | OpenTelemetry Protocol | Logs, Metrics, or Traces |
+| `OtlpDeserializer`* | OpenTelemetry Protocol | Logs, Metrics, or Traces |
 | `AvroDeserializer` | Apache Avro | LogEvent from Avro record |
-| `CsvDeserializer` | CSV rows | LogEvent with header-keyed fields |
+| `InfluxdbDeserializer` | InfluxDB line protocol | Metric events |
+| `VrlDeserializer` | VRL program output | LogEvent values derived by VRL |
+
+\* Feature-gated (`syslog` / `opentelemetry`).
 
 ### Serializers (Sinks)
 

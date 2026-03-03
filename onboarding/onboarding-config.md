@@ -14,6 +14,85 @@ It answers:
 
 For unfamiliar terms, see the [Glossary](./glossary.md).
 
+## What Problem Does the Configuration System Solve? (Conceptual Background)
+
+### The wiring problem
+
+Vector has 120+ components (47 sources, 20+ transforms, 56+ sinks), and users combine them into custom pipelines. The configuration system must solve a hard problem: how do you let users describe an arbitrary directed acyclic graph of components — each with different options, validation rules, and type constraints — in a simple YAML file?
+
+Consider this minimal config:
+
+```yaml
+sources:
+  web_logs:
+    type: file
+    include: ["/var/log/nginx/*.log"]
+
+transforms:
+  parse:
+    type: remap
+    inputs: [web_logs]
+    source: '. = parse_json!(.message)'
+
+sinks:
+  output:
+    type: console
+    inputs: [parse]
+    encoding:
+      codec: json
+```
+
+Behind the scenes, `type: file` must map to the `FileConfig` struct, `type: remap` to `RemapConfig`, and `type: console` to `ConsoleSinkConfig`. Each struct has different fields with different validation rules. The string `"web_logs"` in `inputs: [web_logs]` must be resolved to an actual component output, and the system must verify that the types are compatible (you can't feed metrics into a logs-only sink).
+
+### Dynamic deserialization: how `typetag` solves the mapping problem
+
+The config system needs to deserialize `{ "type": "file", "include": [...] }` into the correct Rust struct without a giant match statement that lists every component. Vector uses `typetag` — a serde extension that maintains a global registry of types:
+
+```
+Config YAML                           Rust types
+─────────────                         ──────────
+type: "file"         ──▸ typetag ──▸  FileConfig
+type: "demo_logs"    ──▸ typetag ──▸  DemoLogsConfig
+type: "http_server"  ──▸ typetag ──▸  HttpServerConfig
+```
+
+Each component registers itself with a `#[typetag::serde(name = "file")]` attribute. When serde encounters `type: "file"`, typetag looks up the registered struct and deserializes the remaining fields into it. This means adding a new component requires zero changes to the config loading code — just implement the trait and add the attribute.
+
+### Multi-file merging: why configs are built in two phases
+
+Production deployments often split configuration across multiple files — a base config with shared settings, environment-specific overrides, and component-specific fragments:
+
+```
+/etc/vector/
+  base.yaml         → global options, common sources
+  transforms.yaml   → processing pipeline
+  sinks-prod.yaml   → production destinations
+```
+
+Vector cannot simply parse each file into a final `Config` directly, because the files may reference each other (a sink in `sinks-prod.yaml` references a transform in `transforms.yaml`). Instead, each file is parsed into a `ConfigBuilder` — a mutable intermediate struct where component inputs are still unresolved strings. Builders are merged, then the combined builder is validated and converted to the final `Config` with resolved `OutputId` references:
+
+```
+base.yaml ────▸ ConfigBuilder ─┐
+transforms.yaml ──▸ ConfigBuilder ─┼──▸ Merged ConfigBuilder ──▸ Validate ──▸ Config
+sinks-prod.yaml ──▸ ConfigBuilder ─┘
+```
+
+This two-phase approach means components defined in different files can reference each other freely, and validation catches all errors (missing inputs, cycles, type mismatches) after merging.
+
+### Config diff: enabling zero-downtime reload
+
+When a config file changes, Vector doesn't restart. It loads the new config, computes a diff against the running config, and applies only the changes:
+
+```
+Old config                    New config                    Diff
+──────────                    ──────────                    ────
+sources: [A, B]               sources: [A, B, C]            to_add: [C]
+transforms: [X, Y]            transforms: [X, Y']           to_change: [Y → Y']
+sinks: [P, Q]                 sinks: [P]                    to_remove: [Q]
+```
+
+The topology stops component Q, rebuilds Y with the new config, starts C, and rewires the graph — all while A, B, X, and P keep running without interruption. This is why `IndexMap` (preserving insertion order) is used for component maps: deterministic diff computation depends on stable ordering.
+
 ## Table of Contents
 
 - [Config Struct](#config-struct)
@@ -103,12 +182,13 @@ Config files are specified via `--config` CLI flags. The loading pipeline at [`s
 
 ### Parsing and Merging
 
-[`load_from_paths()`](../src/config/loading/mod.rs#L127) orchestrates the full pipeline:
+At runtime, [`load_from_paths_with_provider_and_secrets()`](../src/config/loading/mod.rs#L146) orchestrates the full pipeline:
 
 1. Read each file and deserialize into a `ConfigBuilder`.
 2. Merge all builders via `ConfigBuilder::append()`.
 3. Resolve secret backends.
-4. Validate and convert to `Config`.
+4. Optionally load config from a provider backend.
+5. Validate and convert to `Config`.
 
 ### Environment Variable Interpolation
 
@@ -126,7 +206,7 @@ Syntax:
 - `${VAR:-default}` — Variable with default value.
 - `${VAR:?error message}` — Variable with custom error message.
 
-Interpolation can be disabled via `--no-environment-variables` CLI flag.
+Interpolation can be disabled via the `--disable-env-var-interpolation` CLI flag.
 
 ### Secret Backends
 
@@ -274,7 +354,7 @@ A component is considered "changed" if its serialized config differs from the pr
 |------|---------|
 | [`src/config/mod.rs`](../src/config/mod.rs#L148) | `Config` struct, `GlobalOptions` |
 | [`src/config/builder.rs`](../src/config/builder.rs#L18) | `ConfigBuilder`, merging logic |
-| [`src/config/loading/mod.rs`](../src/config/loading/mod.rs#L127) | File loading, parsing, env interpolation |
+| [`src/config/loading/mod.rs`](../src/config/loading/mod.rs#L146) | Runtime loading pipeline (`load_from_paths_with_provider_and_secrets`) |
 | [`src/config/source.rs`](../src/config/source.rs#L86) | `SourceConfig` trait, `SourceOuter` |
 | [`src/config/transform.rs`](../src/config/transform.rs#L198) | `TransformConfig` trait, `TransformOuter` |
 | [`src/config/sink.rs`](../src/config/sink.rs#L238) | `SinkConfig` trait, `SinkOuter` |

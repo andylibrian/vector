@@ -13,6 +13,104 @@ It answers:
 
 For unfamiliar terms, see the [Glossary](./glossary.md).
 
+## Why a Unified Event Model Matters (Conceptual Background)
+
+### The multi-format chaos problem
+
+An observability pipeline ingests data from many sources in many formats: JSON from an HTTP endpoint, syslog from a Unix socket, Prometheus metrics from a scrape target, OpenTelemetry traces from a gRPC stream. Without a unified internal representation, every transform and sink must understand every input format:
+
+```
+Syslog message ──▸ transform must parse syslog
+JSON log ────────▸ transform must parse JSON
+StatsD metric ───▸ transform must parse StatsD
+                    (N formats × M transforms = N×M parsers)
+```
+
+This explodes combinatorially. Adding one new source format means updating every transform and sink.
+
+### How Vector solves this with the Event enum
+
+Vector converts all incoming data into one of three `Event` variants at the source boundary:
+
+```
+Syslog ──▸ [syslog source] ──▸ LogEvent { fields: {message: "...", host: "...", ...} }
+JSON   ──▸ [http source]   ──▸ LogEvent { fields: {level: "error", msg: "..."} }
+StatsD ──▸ [statsd source] ──▸ Metric  { name: "requests", value: Counter(42.0) }
+```
+
+After this conversion, every downstream component works with the same types. A `filter` transform doesn't care whether the event came from syslog or JSON — it sees a `LogEvent` with fields it can inspect. This is the key architectural insight: **format complexity is confined to the edges (sources and sinks), while the core pipeline operates on a universal representation.**
+
+### LogEvent: why a map, not a struct?
+
+Log events could be modeled as a fixed struct with fields like `message`, `timestamp`, `host`. But log formats vary enormously — a Kubernetes pod log has different fields from an Apache access log, which differs from an application JSON log. A fixed struct would require either a rigid schema (losing data that doesn't fit) or a catch-all `extras` map (making the struct pointless).
+
+Instead, `LogEvent` stores its data as a `Value::Object` — a `BTreeMap<KeyString, Value>`. This means any source can insert any fields, and any transform can access or modify them by path. Consider how a JSON log flows through the system:
+
+```
+Input JSON: {"level": "error", "msg": "disk full", "host": {"name": "web-1", "ip": "10.0.1.5"}}
+
+LogEvent fields (BTreeMap):
+  "level"     → Value::Bytes("error")
+  "msg"       → Value::Bytes("disk full")
+  "host"      → Value::Object {
+                    "name" → Value::Bytes("web-1")
+                    "ip"   → Value::Bytes("10.0.1.5")
+                }
+
+Access nested fields:  log.get(path!("host", "name"))  →  Some(Value::Bytes("web-1"))
+```
+
+The `path!()` macro provides type-safe access to nested fields without string parsing at runtime.
+
+### Copy-on-write: why Arc wrapping matters
+
+When a source's output fans out to multiple sinks, every sink needs a copy of the event. Naively cloning a `LogEvent` with a large nested map is expensive. Vector avoids this by wrapping the event data in `Arc<Inner>`:
+
+```
+Source emits event ──▸ Arc<Inner> (refcount = 1)
+                           │
+Fanout to 3 sinks:        │
+  Sink A ──▸ Arc clone ───┤ (refcount = 3, no data copy)
+  Sink B ──▸ Arc clone ───┤
+  Sink C ──▸ Arc clone ───┘
+
+If Sink B needs to modify the event (e.g., add a field):
+  Arc::make_mut() ──▸ creates a private copy only for Sink B
+  Sink A and Sink C still share the original
+```
+
+This is copy-on-write (COW): reads share memory, writes create a private copy only when needed. For read-only paths (most sinks just serialize and send), zero copying occurs.
+
+### Metrics: why an enum of value types?
+
+Metrics are not just numbers. A counter is different from a gauge, which is different from a histogram. Each type has distinct semantics:
+
+```
+Counter { value: 150.0 }              → "150 total requests since start" (monotonically increasing)
+Gauge   { value: 73.2 }               → "CPU is 73.2% right now" (can go up or down)
+Distribution { samples: [...] }        → "these are the raw latency measurements" (for percentiles)
+AggregatedHistogram { buckets: [...] } → "42 requests under 100ms, 18 under 500ms" (pre-bucketed)
+```
+
+A transform that aggregates metrics needs to know the type: you can sum counters, but you must take the latest value for gauges. Combining two histograms means merging their buckets, not adding their totals. The `MetricValue` enum makes these distinctions explicit and prevents accidental misuse.
+
+### EventMetadata: the invisible sidecar
+
+Every event carries metadata that is not part of the user-visible data. This metadata includes delivery-tracking finalizers, schema information, and secrets. It travels alongside the event but is never serialized to the output:
+
+```
+LogEvent visible to user:
+  { "message": "disk full", "host": "web-1" }
+
+EventMetadata (invisible, internal):
+  source_id:         ComponentKey("my_source")
+  finalizers:        [EventFinalizer → reports back to source on delivery]
+  schema_definition: Definition { message: Bytes, host: Bytes }
+  secrets:           { api_token: "sk-..." }
+```
+
+This separation is critical: transforms can freely modify event data without accidentally exposing secrets or breaking delivery tracking. The metadata follows the event through the pipeline automatically.
+
 ## Table of Contents
 
 - [Event Enum](#event-enum)
@@ -274,7 +372,7 @@ The `insert_source_metadata` helper handles both namespaces transparently.
 | [`lib/vector-core/src/event/trace.rs`](../lib/vector-core/src/event/trace.rs) | `TraceEvent` |
 | [`lib/vector-core/src/event/array.rs`](../lib/vector-core/src/event/array.rs#L134) | `EventArray`, `EventContainer` |
 | [`lib/vector-core/src/event/metadata.rs`](../lib/vector-core/src/event/metadata.rs#L28) | `EventMetadata`, secrets, finalizers |
-| [`lib/vector-core/src/event/finalization.rs`](../lib/vector-core/src/event/finalization.rs) | `EventFinalizer`, `EventStatus` |
+| [`lib/vector-common/src/finalization.rs`](../lib/vector-common/src/finalization.rs#L320) | `EventFinalizer`, `EventStatus` |
 
 ---
 
