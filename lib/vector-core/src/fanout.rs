@@ -1,3 +1,34 @@
+//! Fanout pattern for distributing events to multiple consumers.
+//!
+//! The `Fanout` struct is a key building block in Vector's topology. It allows
+//! one source to efficiently distribute events to multiple downstream consumers
+//! (transforms and sinks).
+//!
+//! # How It Works
+//!
+//! ```text
+//! Source → Fanout → Transform A
+//!                 → Transform B
+//!                 → Sink C
+//! ```
+//!
+//! The fanout maintains a list of sender channels, one for each downstream
+//! consumer. When events arrive, they're cloned and sent to each consumer.
+//!
+//! # Backpressure Handling
+//!
+//! If any consumer is slow (its buffer is full), the fanout will wait for it
+//! to catch up before accepting more events. This provides natural backpressure
+//! from slow consumers back to sources.
+//!
+//! # Dynamic Rewiring
+//!
+//! During hot reload, the fanout can be dynamically reconfigured:
+//! - `Add`: Add a new consumer
+//! - `Remove`: Remove a consumer
+//! - `Pause`: Temporarily pause a consumer (during reload)
+//! - `Replace`: Replace a paused consumer with a new sender
+
 use std::{collections::HashMap, fmt, task::Poll, time::Instant};
 
 use futures::{Stream, StreamExt};
@@ -9,6 +40,10 @@ use vector_buffers::topology::channel::BufferSender;
 
 use crate::{config::ComponentKey, event::EventArray};
 
+/// Control messages for dynamically modifying a fanout.
+///
+/// These are used during configuration reload to wire up new components
+/// and disconnect old ones without stopping the entire topology.
 pub enum ControlMessage {
     /// Adds a new sink to the fanout.
     Add(ComponentKey, BufferSender<EventArray>),
@@ -19,7 +54,7 @@ pub enum ControlMessage {
     /// Pauses a sink in the fanout.
     ///
     /// If a fanout has any paused sinks, subsequent sends cannot proceed until all paused sinks
-    /// have been replaced.
+    /// have been replaced. This ensures we don't lose events during reload.
     Pause(ComponentKey),
 
     /// Replaces a paused sink with its new sender.
@@ -42,8 +77,15 @@ impl fmt::Debug for ControlMessage {
 // so that high-lever components don't need to do the raw channel sends, etc.
 pub type ControlChannel = mpsc::UnboundedSender<ControlMessage>;
 
+/// The main fanout structure that distributes events to multiple consumers.
+///
+/// Each consumer is identified by a `ComponentKey` and has its own sender.
+/// The fanout processes control messages to add/remove/replace consumers.
 pub struct Fanout {
+    /// Active senders, keyed by component ID.
+    /// `None` values indicate paused senders waiting for replacement.
     senders: IndexMap<ComponentKey, Option<Sender>>,
+    /// Channel for receiving control messages during reload.
     control_channel: mpsc::UnboundedReceiver<ControlMessage>,
 }
 

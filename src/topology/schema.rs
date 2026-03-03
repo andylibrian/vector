@@ -1,3 +1,8 @@
+//! Schema definition tracking for topology building.
+//!
+//! Vector tracks event structure as data flows through the topology. This is
+//! used for schema validation, documentation, and type-checking in transforms.
+
 use std::collections::HashMap;
 
 use snafu::Snafu;
@@ -14,8 +19,10 @@ pub enum Error {
     ContainsNever,
 }
 
-/// The cache is used whilst building up the topology.
-/// TODO: Describe more, especially why we have a bool in the key.
+/// Cache for schema definitions during topology building.
+///
+/// The key is (schema_enabled, inputs) and the value is the
+/// list of (OutputId, Definition) pairs for those inputs.
 type Cache = HashMap<(bool, Vec<OutputId>), Vec<(OutputId, Definition)>>;
 
 pub fn possible_definitions(

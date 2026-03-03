@@ -24,6 +24,7 @@ use vector_vrl_metrics::MetricsStorage;
 use super::{ComponentKey, OutputId, dot_graph::GraphConfig, schema::Options as SchemaOptions};
 use crate::extra_context::ExtraContext;
 
+/// Type-erased transform configuration.
 pub type BoxedTransform = Box<dyn TransformConfig>;
 
 impl Configurable for BoxedTransform {
@@ -53,6 +54,8 @@ impl<T: TransformConfig + 'static> From<T> for BoxedTransform {
 }
 
 /// Fully resolved transform component.
+///
+/// Wraps the transform configuration with its input connections.
 #[configurable_component]
 #[configurable(metadata(docs::component_base_type = "transform"))]
 #[derive(Clone, Debug)]
@@ -60,15 +63,18 @@ pub struct TransformOuter<T>
 where
     T: Configurable + Serialize + 'static,
 {
+    /// Sources/transforms that feed into this transform.
+    #[configurable(derived)]
+    pub inputs: Inputs<T>,
+
+    /// Graph configuration for visualization.
     #[configurable(derived)]
     #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
     pub graph: GraphConfig,
 
-    #[configurable(derived)]
-    pub inputs: Inputs<T>,
-
-    #[configurable(metadata(docs::hidden))]
+    /// The actual transform configuration.
     #[serde(flatten)]
+    #[configurable(metadata(docs::hidden))]
     pub inner: BoxedTransform,
 }
 

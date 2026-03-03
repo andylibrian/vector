@@ -1,3 +1,29 @@
+//! Configuration system for Vector.
+//!
+//! This module defines the core configuration types that describe a Vector topology.
+//! A Vector configuration specifies:
+//! - **Sources**: Where data comes from (files, network, etc.)
+//! - **Transforms**: How data is processed (filters, parsers, enrichments)
+//! - **Sinks**: Where data goes (databases, message queues, etc.)
+//!
+//! # Architecture Overview
+//!
+//! The configuration system follows a builder pattern:
+//! 1. `ConfigBuilder` - Mutable, used during parsing and construction
+//! 2. `Config` - Immutable, validated, ready for topology building
+//!
+//! The compiler module (`compiler.rs`) handles validation and transformation
+//! from `ConfigBuilder` to `Config`, including:
+//! - Resolving component references (inputs/outputs)
+//! - Detecting cycles in the DAG
+//! - Validating resource conflicts (ports, file descriptors)
+//!
+//! # Hot Reload Support
+//!
+//! Vector supports hot reloading configuration via `ConfigDiff`, which computes
+//! the minimal set of changes needed between old and new configs. This enables
+//! zero-downtime updates where only affected components are restarted.
+
 #![allow(missing_docs)]
 use std::{
     collections::{HashMap, HashSet},
@@ -144,6 +170,13 @@ impl ConfigPath {
     }
 }
 
+/// A validated, ready-to-run Vector configuration.
+///
+/// This is the output of the configuration compiler. It represents a fully
+/// validated topology that can be handed to the topology builder.
+///
+/// The component maps use `IndexMap` to preserve insertion order, which is
+/// important for deterministic config-to-config comparisons during hot reload.
 #[derive(Debug, Default, Serialize)]
 pub struct Config {
     #[cfg(feature = "api")]
@@ -151,12 +184,22 @@ pub struct Config {
     pub schema: schema::Options,
     pub global: GlobalOptions,
     pub healthchecks: HealthcheckOptions,
+    /// All configured sources - the entry points for data into Vector.
+    /// Each source runs as an independent task that produces events.
     sources: IndexMap<ComponentKey, SourceOuter>,
+    /// All configured sinks - the exit points for data from Vector.
+    /// Each sink runs as an independent task that consumes events.
     sinks: IndexMap<ComponentKey, SinkOuter<OutputId>>,
+    /// All configured transforms - the processing nodes in the data flow.
+    /// Transforms sit between sources and sinks, modifying/filtering events.
     transforms: IndexMap<ComponentKey, TransformOuter<OutputId>>,
+    /// Enrichment tables for data enrichment (e.g., GeoIP, static lookup tables).
     pub enrichment_tables: IndexMap<ComponentKey, EnrichmentTableOuter<OutputId>>,
+    /// Unit test definitions embedded in the config.
     tests: Vec<TestDefinition>,
+    /// Secret backend configurations for retrieving sensitive values.
     secret: IndexMap<ComponentKey, SecretBackends>,
+    /// Maximum time to wait for graceful shutdown.
     pub graceful_shutdown_duration: Option<Duration>,
 }
 
@@ -203,6 +246,9 @@ impl Config {
         self.enrichment_tables.get(id)
     }
 
+    /// Gets the input references for a transform, sink, or enrichment table.
+    ///
+    /// This is used during topology building to wire up the event flow.
     pub fn inputs_for_node(&self, id: &ComponentKey) -> Option<&[OutputId]> {
         self.transforms
             .get(id)
@@ -211,6 +257,16 @@ impl Config {
             .or_else(|| self.enrichment_tables.get(id).map(|s| &s.inputs[..]))
     }
 
+    /// Propagates acknowledgement requirements from sinks back to sources.
+    ///
+    /// End-to-end acknowledgements work by having sources wait for confirmation
+    /// that data has been successfully delivered to sinks. This method traces
+    /// the data flow graph backwards from sinks with acknowledgements enabled
+    /// to find which sources need to track delivery.
+    ///
+    /// The propagation follows the chain: Sink -> Transform(s) -> Source.
+    /// If a sink has acknowledgements enabled, all sources feeding it (directly
+    /// or through transforms) must have `sink_acknowledgements` set.
     pub fn propagate_acknowledgements(&mut self) -> Result<(), Vec<String>> {
         let inputs: Vec<_> = self
             .sinks
@@ -312,6 +368,14 @@ impl Default for HealthcheckOptions {
 impl_generate_config_from_default!(HealthcheckOptions);
 
 /// Unique thing, like port, of which only one owner can be.
+///
+/// Resources are used to detect conflicts between components. For example,
+/// two sources can't both listen on the same TCP port. The config compiler
+/// uses this to fail early with a clear error message.
+///
+/// The `DiskBuffer` variant is particularly important - disk buffers use
+/// file-based storage, and having two components write to the same buffer
+/// file would corrupt data.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum Resource {
     Port(SocketAddr, Protocol),
@@ -336,6 +400,11 @@ impl Resource {
     }
 
     /// From given components returns all that have a resource conflict with any other component.
+    ///
+    /// This handles a subtle case with "unspecified" IP addresses (0.0.0.0 or ::).
+    /// Binding to an unspecified address means "bind to all interfaces", so
+    /// 0.0.0.0:8080 conflicts with 192.168.1.1:8080 because the former would
+    /// already be listening on the latter's interface.
     pub fn conflicts<K: Eq + Hash + Clone>(
         components: impl IntoIterator<Item = (K, Vec<Resource>)>,
     ) -> HashMap<Resource, HashSet<K>> {
@@ -401,6 +470,14 @@ impl Display for Resource {
 }
 
 /// A unit test definition.
+///
+/// Vector configs can include inline tests that verify transform behavior.
+/// This is useful for CI/CD pipelines and config validation.
+///
+/// Tests work by:
+/// 1. Injecting synthetic events at a transform's input
+/// 2. Capturing the transform's output
+/// 3. Validating the output against expected conditions
 #[configurable_component]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]

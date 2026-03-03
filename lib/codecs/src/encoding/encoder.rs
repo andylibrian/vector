@@ -1,3 +1,26 @@
+//! Encoder implementation for converting events to bytes.
+//!
+//! Encoders are used by sinks to convert structured events into byte streams
+//! for transmission. The encoding process can be:
+//!
+//! - **Framed**: Each event becomes a separate frame with delimiters
+//! - **Batch**: Multiple events are encoded together (e.g., Arrow format)
+//!
+//! # Serialization Formats
+//!
+//! Common formats include:
+//! - `Text`: Plain text (message field only)
+//! - `Json`: JSON objects
+//! - `Avro`: Apache Avro format
+//! - `Protobuf`: Protocol Buffers
+//!
+//! # Framing
+//!
+//! Framing adds message boundaries:
+//! - `NewlineDelimited`: Append newline after each message
+//! - `LengthDelimited`: Length-prefix each message
+//! - `CharacterDelimited`: Custom delimiter
+
 use bytes::BytesMut;
 use tokio_util::codec::Encoder as _;
 use vector_common::internal_event::emit;
@@ -11,6 +34,9 @@ use crate::{
 };
 
 /// Serializers that support batch encoding (encoding all events at once).
+///
+/// Batch encoding is more efficient for certain formats like Arrow,
+/// where the encoding benefits from knowing all events upfront.
 #[derive(Debug, Clone)]
 pub enum BatchSerializer {
     /// Arrow IPC stream format serializer.
@@ -19,6 +45,9 @@ pub enum BatchSerializer {
 }
 
 /// An encoder that encodes batches of events.
+///
+/// Unlike framed encoding, batch encoding processes all events together,
+/// which is required for columnar formats like Arrow.
 #[derive(Debug, Clone)]
 pub struct BatchEncoder {
     serializer: BatchSerializer,
@@ -68,18 +97,24 @@ impl tokio_util::codec::Encoder<Vec<Event>> for BatchEncoder {
     }
 }
 
-/// An wrapper that supports both framed and batch encoding modes.
+/// A wrapper supporting both framed and batch encoding modes.
+///
+/// This allows sinks to choose the appropriate encoding strategy
+/// based on their requirements.
 #[derive(Debug, Clone)]
 pub enum EncoderKind {
-    /// Uses framing to encode individual events
+    /// Uses framing to encode individual events.
     Framed(Box<Encoder<Framer>>),
-    /// Encodes events in batches without framing
+    /// Encodes events in batches without framing.
     #[cfg(feature = "arrow")]
     Batch(BatchEncoder),
 }
 
+/// An encoder that converts structured events into byte frames.
+///
+/// The encoder combines a serializer (for content) and a framer (for boundaries).
+/// It implements `tokio_util::codec::Encoder` for async I/O integration.
 #[derive(Debug, Clone)]
-/// An encoder that can encode structured events into byte frames.
 pub struct Encoder<Framer>
 where
     Framer: Clone,

@@ -1,3 +1,32 @@
+//! Transform system - processes events as they flow through the topology.
+//!
+//! Transforms are the middle layer of Vector's data pipeline. They sit between
+//! sources (which produce events) and sinks (which consume events).
+//!
+//! # Transform Types
+//!
+//! There are three types of transforms:
+//!
+//! ## FunctionTransform
+//! The simplest transform - processes one event at a time, can be run in parallel.
+//! Use this for stateless, CPU-light transforms.
+//!
+//! ## SyncTransform
+//! A more complex transform that can output to multiple destinations.
+//! Still synchronous but more flexible.
+//!
+//! ## TaskTransform
+//! An async transform that coordinates with other transforms.
+//! Use this for I/O-bound transforms or when you need backpressure.
+//!
+//! # Output Routing
+//!
+//! Transforms can have multiple outputs:
+//! - Default output (unnamed)
+//! - Named outputs (for conditional routing)
+//!
+//! The `TransformOutputs` struct manages this routing.
+
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 
 use futures::{Stream, StreamExt};
@@ -14,13 +43,16 @@ pub mod runtime_transform;
 
 pub use outputs::{OutputBuffer, TransformOutputs, TransformOutputsBuf};
 
-/// Transforms come in two variants. Functions, or tasks.
+/// The transform enum - each transform is one of these variants.
 ///
 /// While function transforms can be run out of order, or concurrently, task
 /// transforms act as a coordination or barrier point.
 pub enum Transform {
+    /// Simple stateless transform that processes one event at a time.
     Function(Box<dyn FunctionTransform>),
+    /// Synchronous transform that can output to multiple destinations.
     Synchronous(Box<dyn SyncTransform>),
+    /// Async transform that coordinates with other transforms.
     Task(Box<dyn TaskTransform<EventArray>>),
 }
 
@@ -87,13 +119,13 @@ impl Transform {
     }
 }
 
-/// Transforms that are simple, and don't require attention to coordination.
-/// You can run them as simple functions over events in any order.
+/// A simple stateless transform.
 ///
-/// # Invariants
+/// These transforms are "stateless" and can be run in parallel, without
+/// regard for coordination. Each event is processed independently.
 ///
-/// * It is an illegal invariant to implement `FunctionTransform` for a
-///   `TaskTransform` or vice versa.
+/// **Note:** You should prefer to implement this over [`TaskTransform`]
+/// where possible, as it's more efficient.
 pub trait FunctionTransform: Send + dyn_clone::DynClone + Sync {
     fn transform(&mut self, output: &mut OutputBuffer, event: Event);
 }

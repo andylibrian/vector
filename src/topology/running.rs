@@ -1,3 +1,27 @@
+//! Running topology management and hot reload coordination.
+//!
+//! This module manages a running Vector topology, handling:
+//! - Component lifecycle (starting, stopping, reloading)
+//! - Configuration hot reload with minimal disruption
+//! - Graceful shutdown coordination
+//! - Health check management
+//!
+//! # Hot Reload Architecture
+//!
+//! When a configuration change is detected:
+//! 1. `ConfigDiff` computes what changed between old and new configs
+//! 2. Components are stopped/started/modified based on the diff
+//! 3. Buffers are preserved for sinks that aren't removed
+//! 4. The topology remains operational throughout (zero-downtime reload)
+//!
+//! # Shutdown Sequence
+//!
+//! Graceful shutdown follows this order:
+//! 1. Sources are signaled to stop producing new events
+//! 2. In-flight events continue through transforms
+//! 3. Sinks drain their buffers
+//! 4. If timeout is reached, force shutdown occurs
+
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -52,26 +76,51 @@ pub enum ReloadError {
     FailedToRestore,
 }
 
+/// A running Vector topology with active components.
+///
+/// This struct owns all the running tasks for sources, transforms, and sinks,
+/// as well as the channels connecting them. It's the runtime representation
+/// of a validated `Config`.
+///
+/// # Thread Safety
+///
+/// The `running` flag is shared with the API server to report health status.
+/// The `abort_tx` channel allows any component to signal a fatal error.
 #[allow(dead_code)]
 pub struct RunningTopology {
+    /// Senders for injecting events into each component (transforms and sinks).
     inputs: HashMap<ComponentKey, BufferSender<EventArray>>,
+    /// Metadata about component inputs for the tap API.
     inputs_tap_metadata: HashMap<ComponentKey, Inputs<OutputId>>,
+    /// Control channels for fanout outputs (used during reload).
     outputs: HashMap<OutputId, ControlChannel>,
+    /// Metadata about component outputs for the tap API.
     outputs_tap_metadata: HashMap<ComponentKey, (&'static str, String)>,
+    /// Source tasks - these produce events.
     source_tasks: HashMap<ComponentKey, TaskHandle>,
+    /// Transform and sink tasks.
     tasks: HashMap<ComponentKey, TaskHandle>,
+    /// Coordinates graceful shutdown of sources.
     shutdown_coordinator: SourceShutdownCoordinator,
+    /// Triggers to detach sinks during reload (for buffer preservation).
     detach_triggers: HashMap<ComponentKey, DisabledTrigger>,
+    /// The current configuration this topology was built from.
     pub(crate) config: Config,
+    /// Channel to signal fatal errors that should abort the process.
     pub(crate) abort_tx: mpsc::UnboundedSender<ShutdownError>,
+    /// Watch channel for topology changes (used by tap API).
     watch: (WatchTx, WatchRx),
+    /// Shared flag indicating if the topology is running (for health checks).
     pub(crate) running: Arc<AtomicBool>,
+    /// Maximum time to wait for graceful shutdown.
     graceful_shutdown_duration: Option<Duration>,
+    /// Registry for utilization tracking across components.
     utilization_registry: Option<UtilizationRegistry>,
     utilization_task: Option<TaskHandle>,
     utilization_task_shutdown_trigger: Option<Trigger>,
     metrics_task: Option<TaskHandle>,
     metrics_task_shutdown_trigger: Option<Trigger>,
+    /// Components that need reload on next configuration change.
     pending_reload: Option<HashSet<ComponentKey>>,
 }
 

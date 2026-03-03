@@ -1,3 +1,28 @@
+//! Sink configuration traits and types.
+//!
+//! Sinks are the exit points for data from Vector. They:
+//! - Receive processed events from transforms (or directly from sources)
+//! - Serialize and send data to external systems
+//! - Handle acknowledgements for end-to-end delivery guarantees
+//!
+//! # Buffer Management
+//!
+//! Sinks have configurable buffers that provide:
+//! - Backpressure handling (block or drop when full)
+//! - Persistence across restarts (disk buffers)
+//! - In-memory buffering for throughput
+//!
+//! # Health Checks
+//!
+//! Sinks can have health checks that verify connectivity
+//! before Vector declares itself ready.
+//!
+//! # Implementing a Sink
+//!
+//! 1. Create a config struct implementing `SinkConfig`
+//! 2. Implement `build()` to create the sink runtime
+//! 3. Define input type requirements (logs, metrics, or both)
+
 use std::{cell::RefCell, path::PathBuf, time::Duration};
 
 use async_trait::async_trait;
@@ -24,6 +49,9 @@ use crate::{
     sinks::{Healthcheck, util::UriSerde},
 };
 
+/// Type-erased sink configuration.
+///
+/// This allows storing any sink config in a unified collection.
 pub type BoxedSink = Box<dyn SinkConfig>;
 
 impl Configurable for BoxedSink {
@@ -53,6 +81,9 @@ impl<T: SinkConfig + 'static> From<T> for BoxedSink {
 }
 
 /// Fully resolved sink component.
+///
+/// Wraps the sink configuration with its inputs, buffer settings,
+/// health check options, and proxy configuration.
 #[configurable_component]
 #[configurable(metadata(docs::component_base_type = "sink"))]
 #[derive(Clone, Debug)]
@@ -60,10 +91,12 @@ pub struct SinkOuter<T>
 where
     T: Configurable + Serialize + 'static,
 {
+    /// Graph configuration for visualization.
     #[configurable(derived)]
     #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
     pub graph: GraphConfig,
 
+    /// Transforms/sources that feed into this sink.
     #[configurable(derived)]
     pub inputs: Inputs<T>,
 
@@ -74,18 +107,22 @@ where
     #[configurable(deprecated, metadata(docs::hidden), validation(format = "uri"))]
     pub healthcheck_uri: Option<UriSerde>,
 
+    /// Health check configuration.
     #[configurable(derived, metadata(docs::advanced))]
     #[serde(default, deserialize_with = "crate::serde::bool_or_struct")]
     pub healthcheck: SinkHealthcheckOptions,
 
+    /// Buffer configuration for this sink.
     #[configurable(derived)]
     #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
     pub buffer: BufferConfig,
 
+    /// Proxy configuration for HTTP-based sinks.
     #[configurable(derived)]
     #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
     pub proxy: ProxyConfig,
 
+    /// The actual sink configuration.
     #[serde(flatten)]
     #[configurable(metadata(docs::hidden))]
     pub inner: BoxedSink,

@@ -1,3 +1,32 @@
+//! Log event implementation - the most common event type in Vector.
+//!
+//! A `LogEvent` is essentially a flexible key-value map that represents
+//! structured log data. It supports:
+//!
+//! - Arbitrary field names and values
+//! - Nested structures (objects, arrays)
+//! - Metadata for tracking source and schema
+//!
+//! # Key Features
+//!
+//! ## Lazy Size Calculation
+//!
+//! The size of a log event is cached to avoid repeated calculations.
+//! This is important because events may be inspected many times as they
+//! flow through the topology.
+//!
+//! ## Arc-Based Cloning
+//!
+//! Log events use `Arc` internally for cheap cloning. Modifications
+//! use copy-on-write semantics via `Arc::make_mut`.
+//!
+//! ## Field Access
+//!
+//! Fields can be accessed using:
+//! - Direct key lookup: `event.get("message")`
+//! - Path-based lookup: `event.get_by_path(&["nested", "field"])`
+//! - VRL-compatible access via the `Value` trait
+
 use std::{
     collections::HashMap,
     convert::{TryFrom, TryInto},
@@ -47,14 +76,21 @@ static VECTOR_SOURCE_TYPE_PATH: LazyLock<Option<OwnedTargetPath>> = LazyLock::ne
     )))
 });
 
+/// Internal representation of a log event.
+///
+/// Uses `Arc` for cheap cloning. The size caches are invalidated
+/// whenever the event is mutated.
 #[derive(Debug, Deserialize)]
 struct Inner {
+    /// The actual event data as a VRL Value (typically an Object).
     #[serde(flatten)]
     fields: Value,
 
+    /// Cached byte size for memory accounting.
     #[serde(skip)]
     size_cache: AtomicCell<Option<NonZeroUsize>>,
 
+    /// Cached JSON-encoded size for serialization estimates.
     #[serde(skip)]
     json_encoded_size_cache: AtomicCell<Option<NonZeroJsonSize>>,
 }
@@ -128,6 +164,7 @@ impl Default for Inner {
     fn default() -> Self {
         Self {
             // **IMPORTANT:** Due to numerous legacy reasons this **must** be a Map variant.
+            // This means a default LogEvent is an empty object {}, not null or undefined.
             fields: Value::Object(Default::default()),
             size_cache: Default::default(),
             json_encoded_size_cache: Default::default(),

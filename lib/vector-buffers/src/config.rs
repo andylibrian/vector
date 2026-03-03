@@ -1,3 +1,23 @@
+//! Buffer configuration for Vector's backpressure system.
+//!
+//! Buffers are crucial for handling flow control between components:
+//!
+//! - **Memory buffers**: Fast, but limited by available RAM
+//! - **Disk buffers**: Larger capacity, persistent across restarts
+//!
+//! # Backpressure Strategy
+//!
+//! When a buffer is full, the `when_full` setting determines behavior:
+//! - `Block`: Wait for space (provides natural backpressure)
+//! - `DropNewest`: Discard incoming events (prevents deadlock)
+//! - `DropNewestInComponent`: Discard within the component's buffer
+//!
+//! # Disk Buffer Considerations
+//!
+//! Disk buffers are identified by component name. If a sink is removed and
+//! re-added with the same name, it will resume from where it left off.
+//! This is essential for zero-downtime configuration reloads.
+
 use std::{
     fmt,
     num::{NonZeroU64, NonZeroUsize},
@@ -20,6 +40,7 @@ use crate::{
     variants::{DiskV2Buffer, MemoryBuffer},
 };
 
+/// Errors that can occur when building a buffer.
 #[derive(Debug, Snafu)]
 pub enum BufferBuildError {
     #[snafu(display("the configured buffer type requires `data_dir` be specified"))]
@@ -30,6 +51,10 @@ pub enum BufferBuildError {
     InvalidMaxEvents,
 }
 
+/// The type of buffer to use.
+///
+/// This enum is used during configuration deserialization to determine
+/// which buffer variant to create.
 #[derive(Deserialize, Serialize)]
 enum BufferTypeKind {
     #[serde(rename = "memory")]

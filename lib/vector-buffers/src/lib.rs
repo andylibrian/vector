@@ -1,7 +1,29 @@
-//! The Vector Core buffer
+//! The Vector buffer system.
 //!
-//! This library implements a channel like functionality, one variant which is
-//! solely in-memory and the other that is on-disk. Both variants are bounded.
+//! Buffers are a critical component for handling backpressure in Vector.
+//! They sit between components and absorb temporary differences in
+//! processing speed.
+//!
+//! # Buffer Types
+//!
+//! - **Memory buffers**: Fast, but limited by available RAM
+//! - **Disk buffers**: Larger capacity, persistent across restarts
+//!
+//! # Backpressure Behavior
+//!
+//! When a buffer is full, the `WhenFull` setting determines what happens:
+//! - `Block`: Wait for space (propagates backpressure upstream)
+//! - `DropNewest`: Discard incoming events (prevents deadlock)
+//! - `Overflow`: Try the next buffer stage (for multi-stage buffers)
+//!
+//! # Buffer Topology
+//!
+//! Buffers can be chained into a topology:
+//! ```
+//! [Memory Buffer] → [Disk Buffer] → Sink
+//! ```
+//!
+//! This allows for a fast in-memory buffer with a larger disk overflow.
 
 #![deny(warnings)]
 #![deny(clippy::all)]
@@ -38,7 +60,10 @@ use std::fmt::Debug;
 use quickcheck::{Arbitrary, Gen};
 use vector_common::{byte_size_of::ByteSizeOf, finalization::AddBatchNotifier};
 
-/// Event handling behavior when a buffer is full.
+/// What to do when a buffer is full.
+///
+/// This controls backpressure behavior - how Vector handles situations
+/// where data is arriving faster than it can be processed.
 #[configurable_component]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]

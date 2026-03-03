@@ -1,3 +1,22 @@
+//! Configuration loading and file processing.
+//!
+//! This module handles reading configuration from files, directories, and strings,
+//! with support for:
+//! - Multiple formats (TOML, JSON, YAML)
+//! - Environment variable interpolation
+//! - Glob patterns for file matching
+//! - Secret backend integration
+//! - Remote configuration providers
+//!
+//! # Loading Pipeline
+//!
+//! 1. **Path expansion**: Glob patterns are expanded, default paths are applied
+//! 2. **Reading**: Files are read and environment variables are interpolated
+//! 3. **Parsing**: Content is deserialized into a ConfigBuilder
+//! 4. **Secret resolution**: Secret backends are queried for sensitive values
+//! 5. **Provider resolution**: Remote config providers (if configured) are contacted
+//! 6. **Compilation**: ConfigBuilder is compiled into a validated Config
+
 mod config_builder;
 mod loader;
 mod secret;
@@ -25,6 +44,11 @@ use super::{
 };
 use crate::signal;
 
+/// Global storage for the resolved config paths.
+///
+/// This is used by the API and other subsystems to know which files
+/// Vector is currently using for configuration. Updated during path
+/// processing and read during reload operations.
 pub static CONFIG_PATHS: Mutex<Vec<ConfigPath>> = Mutex::new(Vec::new());
 
 pub(super) fn read_dir<P: AsRef<Path> + Debug>(path: P) -> Result<ReadDir, Vec<String>> {
@@ -72,6 +96,14 @@ pub fn merge_path_lists(
 
 /// Expand a list of paths (potentially containing glob patterns) into real
 /// config paths, replacing it with the default paths when empty.
+///
+/// This function:
+/// 1. Falls back to default paths if none provided
+/// 2. Expands glob patterns (e.g., `/etc/vector/*.toml`)
+/// 3. Deduplicates and sorts the results
+/// 4. Stores paths globally for later reference (e.g., during reload)
+///
+/// Returns None if any glob pattern is invalid or no files match.
 pub fn process_paths(config_paths: &[ConfigPath]) -> Option<Vec<ConfigPath>> {
     let starting_paths = if !config_paths.is_empty() {
         config_paths.to_owned()

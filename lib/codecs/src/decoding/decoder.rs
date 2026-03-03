@@ -1,3 +1,31 @@
+//! Decoder implementation for converting bytes to events.
+//!
+//! Decoders are used by sources to convert raw byte streams into structured
+//! events. The decoding process has two stages:
+//!
+//! 1. **Framing**: Split the byte stream into individual messages
+//! 2. **Deserialization**: Parse each message into events
+//!
+//! # Framing
+//!
+//! Framing determines message boundaries:
+//! - `NewlineDelimited`: Messages separated by newlines
+//! - `LengthDelimited`: Length-prefixed messages
+//! - `CharacterDelimited`: Custom delimiter (e.g., CSV)
+//!
+//! # Deserialization
+//!
+//! Deserialization parses the framed bytes:
+//! - `Bytes`: Raw bytes as-is
+//! - `Json`: JSON objects
+//! - `Syslog`: Syslog format
+//! - `Gelf`: Graylog Extended Log Format
+//!
+//! # Error Handling
+//!
+//! Decoding errors are non-fatal by default. The decoder can recover from
+//! a malformed message and continue processing subsequent messages.
+
 use bytes::{Bytes, BytesMut};
 use smallvec::SmallVec;
 use vector_common::internal_event::emit;
@@ -13,15 +41,18 @@ use crate::{
 
 type DecodedFrame = (SmallVec<[Event; 1]>, usize);
 
-/// A decoder that can decode structured events from a byte stream / byte
-/// messages.
+/// A decoder that converts byte streams into structured events.
+///
+/// The decoder combines a framer (for message boundaries) and a deserializer
+/// (for parsing content). It implements `tokio_util::codec::Decoder` for
+/// seamless integration with async I/O.
 #[derive(Clone)]
 pub struct Decoder {
-    /// The framer being used.
+    /// The framer being used to split the stream into messages.
     pub framer: Framer,
-    /// The deserializer being used.
+    /// The deserializer being used to parse messages into events.
     pub deserializer: Deserializer,
-    /// The `log_namespace` being used.
+    /// The log namespace (legacy vs. modern field naming).
     pub log_namespace: LogNamespace,
 }
 

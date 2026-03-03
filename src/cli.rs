@@ -1,3 +1,34 @@
+//! Command-line interface definition for Vector.
+//!
+//! This module defines all CLI flags, options, and subcommands using the Clap derive macro system.
+//! The CLI is the primary entry point for configuring and controlling Vector's runtime behavior.
+//!
+//! # Architecture Overview
+//!
+//! The CLI is structured as a two-level command hierarchy:
+//! - **Root options**: Global flags that apply to the main `vector` run command (config paths,
+//!   logging, threading, etc.)
+//! - **Subcommands**: Specialized commands like `validate`, `test`, `graph`, `top`, etc.
+//!
+//! # Key Design Decisions
+//!
+//! ## Log Level Logic
+//!
+//! The `log_level()` method implements a nuanced approach to verbosity:
+//! - For utility subcommands (validate, graph, list, test, etc.), we adjust the effective
+//!   verbosity level to reduce noise - either adding 1 to quiet or subtracting 1 from verbose.
+//! - This ensures these commands produce cleaner output by default.
+//!
+//! ## Configuration Path Flexibility
+//!
+//! Vector supports multiple ways to specify configuration:
+//! - `--config`: Format auto-detected from file extension
+//! - `--config-toml/json/yaml`: Explicit format specification
+//! - `--config-dir`: Load all config files from a directory
+//!
+//! This flexibility is crucial for complex deployments where configs may be split across
+//! multiple files or managed by external systems.
+
 #![allow(missing_docs)]
 
 use std::{num::NonZeroU64, path::PathBuf};
@@ -33,6 +64,11 @@ impl Opts {
         Opts::from_arg_matches(&app.get_matches())
     }
 
+    /// Determines the effective log level based on quiet/verbose flags.
+    ///
+    /// This implements a priority system where `--quiet` overrides `--verbose`.
+    /// For utility subcommands (validate, graph, etc.), we shift the effective level
+    /// to reduce log noise during their output.
     pub const fn log_level(&self) -> &'static str {
         let (quiet_level, verbose_level) = match self.sub_command {
             Some(SubCommand::Validate(_))
@@ -62,6 +98,10 @@ impl Opts {
     }
 }
 
+/// Root-level CLI options that control Vector's core behavior.
+///
+/// These options are available for the main `vector` run command and affect
+/// how Vector loads configuration, manages logging, and handles the runtime.
 #[derive(Parser, Debug)]
 #[command(rename_all = "kebab-case")]
 pub struct RootOpts {
@@ -121,11 +161,19 @@ pub struct RootOpts {
     )]
     pub config_paths_yaml: Vec<PathBuf>,
 
-    /// Exit on startup if any sinks fail healthchecks
+    /// Exit on startup if any sinks fail healthchecks.
+    ///
+    /// This is crucial for fail-fast behavior in production - if a sink's
+    /// downstream service is unavailable, Vector will refuse to start rather
+    /// than silently dropping data.
     #[arg(short, long, env = "VECTOR_REQUIRE_HEALTHY")]
     pub require_healthy: Option<bool>,
 
-    /// Number of threads to use for processing (default is number of available cores)
+    /// Number of threads to use for processing (default is number of available cores).
+    ///
+    /// This controls the size of the Tokio runtime's thread pool. For I/O-bound
+    /// workloads, fewer threads may be sufficient. For CPU-intensive transforms,
+    /// matching core count is usually optimal.
     #[arg(short, long, env = "VECTOR_THREADS")]
     pub threads: Option<usize>,
 
@@ -138,6 +186,9 @@ pub struct RootOpts {
     pub quiet: u8,
 
     /// Disable interpolation of environment variables in configuration files.
+    ///
+    /// By default, Vector supports ${ENV_VAR} syntax in config files. This flag
+    /// disables that for security or debugging purposes.
     #[arg(
         long,
         env = "VECTOR_DISABLE_ENV_VAR_INTERPOLATION",
@@ -160,6 +211,10 @@ pub struct RootOpts {
     pub color: Color,
 
     /// Watch for changes in configuration file, and reload accordingly.
+    ///
+    /// When enabled, Vector uses inotify (Linux), kqueue (macOS), or ReadDirectoryChangesW (Windows)
+    /// to detect config changes and trigger a hot reload. This enables zero-downtime
+    /// configuration updates.
     #[arg(short, long, env = "VECTOR_WATCH_CONFIG")]
     pub watch_config: bool,
 
@@ -213,6 +268,12 @@ pub struct RootOpts {
     /// Set the duration in seconds to wait for graceful shutdown after SIGINT or SIGTERM are
     /// received. After the duration has passed, Vector will force shutdown. To never force
     /// shutdown, use `--no-graceful-shutdown-limit`.
+    ///
+    /// During graceful shutdown, Vector:
+    /// 1. Stops accepting new data from sources
+    /// 2. Drains in-flight events through transforms
+    /// 3. Flushes buffers to sinks
+    /// 4. Waits for acknowledgements (if enabled)
     #[arg(
         long,
         default_value = "60",
@@ -263,7 +324,15 @@ pub struct RootOpts {
 }
 
 impl RootOpts {
-    /// Return a list of config paths with the associated formats.
+    /// Consolidates all config path specifications into a unified list.
+    ///
+    /// This merges paths from:
+    /// - `--config` (format auto-detected)
+    /// - `--config-toml/json/yaml` (explicit format)
+    /// - `--config-dir` (directory scanning)
+    ///
+    /// The result is used by the config loading system to find and merge all
+    /// configuration files.
     pub fn config_paths_with_formats(&self) -> Vec<config::ConfigPath> {
         config::merge_path_lists(vec![
             (&self.config_paths, None),
@@ -280,6 +349,14 @@ impl RootOpts {
         .collect()
     }
 
+    /// Initializes global state that must be set up before the main application runs.
+    ///
+    /// This currently handles:
+    /// - OpenSSL certificate path probing (unless disabled)
+    /// - Metrics subsystem initialization
+    ///
+    /// The OpenSSL probing is necessary because many TLS libraries don't know where
+    /// to find certificates on non-standard paths, especially in containers.
     pub fn init_global(&self) {
         if !self.openssl_no_probe {
             unsafe {
@@ -291,6 +368,11 @@ impl RootOpts {
     }
 }
 
+/// Vector subcommands for specialized operations.
+///
+/// Each subcommand is a self-contained operation that exits after completion.
+/// They don't start the main Vector topology (except `run` which is the default
+/// when no subcommand is specified).
 #[derive(Parser, Debug)]
 #[command(rename_all = "kebab-case")]
 pub enum SubCommand {
@@ -353,6 +435,11 @@ pub enum SubCommand {
 }
 
 impl SubCommand {
+    /// Executes the subcommand with the given signal handler and color settings.
+    ///
+    /// Each subcommand handles its own execution flow and returns an exit code.
+    /// The signal pair allows subcommands like `tap` and `test` to respond to
+    /// SIGINT/SIGTERM appropriately.
     pub async fn execute(
         &self,
         mut signals: signal::SignalPair,
@@ -379,6 +466,7 @@ impl SubCommand {
     }
 }
 
+/// Controls when ANSI color codes are used in terminal output.
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Color {
     Auto,
@@ -387,6 +475,11 @@ pub enum Color {
 }
 
 impl Color {
+    /// Determines whether to actually use ANSI colors based on the setting
+    /// and terminal capabilities.
+    ///
+    /// Note: On Windows, ANSI colors are disabled by default because cmd.exe
+    /// doesn't support them (though modern Windows Terminal does).
     pub fn use_color(&self) -> bool {
         match self {
             #[cfg(unix)]
@@ -402,12 +495,18 @@ impl Color {
     }
 }
 
+/// Output format for Vector's internal logs.
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
     Text,
     Json,
 }
 
+/// Configuration file watching method.
+///
+/// The default (Recommended) uses OS-native file system notifications which
+/// are efficient but may not work in all environments (e.g., network mounts).
+/// Poll-based watching is slower but works everywhere.
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchConfigMethod {
     /// Recommended watcher for the current OS, usually `inotify` for Linux-based systems.
@@ -417,6 +516,10 @@ pub enum WatchConfigMethod {
     Poll,
 }
 
+/// Handles configuration errors by logging them and returning the appropriate exit code.
+///
+/// This is used during startup to report config validation failures before
+/// the main topology can be built.
 pub fn handle_config_errors(errors: Vec<String>) -> exitcode::ExitCode {
     for error in errors {
         error!(message = "Configuration error.", %error, internal_log_rate_limit = false);

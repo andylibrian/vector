@@ -1,3 +1,38 @@
+//! Event system - the core data model for Vector.
+//!
+//! Events are the fundamental unit of data flowing through Vector. This module
+//! defines three event types:
+//!
+//! - **Log**: Structured log data (key-value pairs)
+//! - **Metric**: Time-series metrics (counters, gauges, histograms, etc.)
+//! - **Trace**: Distributed tracing spans
+//!
+//! # Event Flow
+//!
+//! 1. Sources produce events from external systems
+//! 2. Transforms process/modify events
+//! 3. Sinks serialize and send events to destinations
+//!
+//! # Key Concepts
+//!
+//! ## Event Arrays
+//!
+//! Events are typically processed in batches (`EventArray`) for efficiency.
+//! This reduces per-event overhead and enables better throughput.
+//!
+//! ## Finalization
+//!
+//! Events can have finalizers attached - callbacks that are invoked when
+//! the event is either successfully delivered or dropped. This enables
+//! end-to-end acknowledgements.
+//!
+//! ## Metadata
+//!
+//! Each event carries metadata including:
+//! - Source component ID
+//! - Timestamps for latency tracking
+//! - Schema definitions for structure tracking
+
 use std::{convert::TryInto, fmt::Debug, sync::Arc};
 
 pub use array::{EventArray, EventContainer, LogArray, MetricArray, TraceArray, into_event_stream};
@@ -44,6 +79,12 @@ mod vrl_target;
 
 pub const PARTIAL: &str = "_partial";
 
+/// The primary event enum - each event flowing through Vector is one of these.
+///
+/// This enum is deliberately kept small. The complexity is in the variants:
+/// - `LogEvent` is a flexible key-value store
+/// - `Metric` is a structured metric with name, tags, value, etc.
+/// - `TraceEvent` represents a span in distributed tracing
 #[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)]

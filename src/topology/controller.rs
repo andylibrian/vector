@@ -1,3 +1,21 @@
+//! Topology controller for managing configuration reloads.
+//!
+//! The `TopologyController` wraps a `RunningTopology` and provides:
+//! - Thread-safe access via `SharedTopologyController`
+//! - Configuration hot reload with rollback on failure
+//! - API server lifecycle management
+//!
+//! # Reload Flow
+//!
+//! When `reload()` is called:
+//! 1. The new config is validated against the current topology
+//! 2. If global options changed that require restart, reload is rejected
+//! 3. Components are stopped/started based on the diff
+//! 4. If any step fails, the old topology is restored (rollback)
+//!
+//! The controller ensures that Vector remains operational even if
+//! a configuration change is invalid or components fail to start.
+
 use std::sync::Arc;
 
 use futures_util::FutureExt as _;
@@ -13,6 +31,11 @@ use crate::{
     topology::{ReloadError, RunningTopology},
 };
 
+/// Thread-safe wrapper around `TopologyController`.
+///
+/// This allows multiple parts of the system (signal handler, API, etc.)
+/// to safely access and modify the topology. The mutex ensures only one
+/// reload operation happens at a time.
 #[derive(Clone, Debug)]
 pub struct SharedTopologyController(Arc<Mutex<TopologyController>>);
 
@@ -34,12 +57,23 @@ impl SharedTopologyController {
     }
 }
 
+/// Controls a running topology and manages reloads.
+///
+/// This is the primary interface for:
+/// - Starting/stopping the topology
+/// - Hot-reloading configuration
+/// - Managing the API server lifecycle
 pub struct TopologyController {
+    /// The running topology being controlled.
     pub topology: RunningTopology,
+    /// Paths to configuration files (for reload detection).
     pub config_paths: Vec<config::ConfigPath>,
+    /// Whether to require healthy sinks before proceeding.
     pub require_healthy: Option<bool>,
+    /// The running API server (if enabled).
     #[cfg(feature = "api")]
     pub api_server: Option<api::Server>,
+    /// Extra context passed to components during build.
     pub extra_context: ExtraContext,
 }
 
@@ -52,11 +86,16 @@ impl std::fmt::Debug for TopologyController {
     }
 }
 
+/// Result of a configuration reload attempt.
 #[derive(Clone, Debug)]
 pub enum ReloadOutcome {
+    /// API key was missing (for API-triggered reloads).
     MissingApiKey,
+    /// Reload completed successfully.
     Success,
+    /// Reload failed and was rolled back to the previous config.
     RolledBack,
+    /// A fatal error occurred that requires shutdown.
     FatalError(ShutdownError),
 }
 

@@ -1,3 +1,14 @@
+//! Configuration builder for constructing Vector configs.
+//!
+//! The `ConfigBuilder` is the mutable, pre-validation representation of a Vector
+//! configuration. It's used during:
+//! - Config file parsing (multiple files are merged into one builder)
+//! - Programmatic config construction (tests, examples)
+//! - Config transformation before compilation
+//!
+//! The builder is compiled into a `Config` via the `compiler` module, which
+//! performs validation and resolution of component references.
+
 use std::{path::Path, time::Duration};
 
 use indexmap::IndexMap;
@@ -11,7 +22,21 @@ use super::{
 };
 use crate::{enrichment_tables::EnrichmentTables, providers::Providers, secrets::SecretBackends};
 
-/// A complete Vector configuration.
+/// A complete Vector configuration in builder form.
+///
+/// This is the mutable, pre-validation representation. Key differences from `Config`:
+/// - Component inputs are strings (not resolved OutputIds)
+/// - Can be incomplete (validation happens during build)
+/// - Supports merging multiple configs via `append()`
+///
+/// The builder pattern allows configs to be constructed incrementally:
+/// ```ignore
+/// let mut builder = ConfigBuilder::default();
+/// builder.add_source("in", stdin_source);
+/// builder.add_transform("parse", &["in"], parse_transform);
+/// builder.add_sink("out", &["parse"], console_sink);
+/// let config = builder.build()?;
+/// ```
 #[configurable_component]
 #[derive(Clone, Debug, Default)]
 #[serde(deny_unknown_fields)]
@@ -130,6 +155,15 @@ impl From<Config> for ConfigBuilder {
 }
 
 impl ConfigBuilder {
+    /// Compiles the builder into a validated Config.
+    ///
+    /// This runs the full validation pipeline including:
+    /// - Component reference resolution
+    /// - Cycle detection
+    /// - Resource conflict detection
+    /// - Type compatibility checks
+    ///
+    /// Warnings (like unused components) are logged but don't cause failure.
     pub fn build(self) -> Result<Config, Vec<String>> {
         let (config, warnings) = self.build_with_warnings()?;
 
@@ -140,10 +174,15 @@ impl ConfigBuilder {
         Ok(config)
     }
 
+    /// Compiles the builder and returns both the config and any warnings.
+    ///
+    /// Use this when you need to programmatically inspect warnings
+    /// rather than just logging them.
     pub fn build_with_warnings(self) -> Result<(Config, Vec<String>), Vec<String>> {
         compiler::compile(self)
     }
 
+    /// Adds an enrichment table with the given inputs.
     pub fn add_enrichment_table<K: Into<String>, E: Into<EnrichmentTables>>(
         &mut self,
         key: K,
@@ -205,6 +244,15 @@ impl ConfigBuilder {
         self.global.data_dir = Some(path.to_owned());
     }
 
+    /// Merges another config builder into this one.
+    ///
+    /// This is used when loading multiple config files - each file is parsed
+    /// into a builder, then all builders are merged. The merge validates that:
+    /// - No duplicate component names (sources, transforms, sinks, etc.)
+    /// - No conflicting global options
+    /// - No duplicate test names
+    ///
+    /// The merge is atomic - if any conflict is found, no changes are made.
     pub fn append(&mut self, with: Self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 

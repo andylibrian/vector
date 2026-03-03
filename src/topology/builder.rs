@@ -1,3 +1,46 @@
+//! Topology builder - constructs the running topology from configuration.
+//!
+//! This module is responsible for:
+//! - Creating Tokio tasks for each component
+//! - Wiring up async channels between components
+//! - Setting up buffers and backpressure mechanisms
+//! - Coordinating graceful shutdown
+//!
+//! # Component Lifecycle
+//!
+//! Each component becomes a `Task` that runs as a Tokio task:
+//! - **Sources**: Produce events, with a "pump" task that fans out to transforms
+//! - **Transforms**: Process events, have one task
+//! - **Sinks**: Consume events, have their own task plus a healthcheck task
+//!
+//! # Key Design Patterns
+//!
+//! ## Fanout Pattern
+//!
+//! Each source output goes through a "source output pump" - a dedicated task that
+//! reads from the source sender and fans out to in-flight events to downstream
+//! transforms/sinks. This pattern allows sources to have multiple outputs without
+//! blocking.
+//!
+//! ## Transform Types
+//!
+//! Transforms come in three flavors:
+//! - `SyncTransform`: Simple, synchronous transform (runs in same task)
+//! - `TaskTransform`: Async transform (owns its task and stream)
+//! - `FunctionTransform`: Same as SyncTransform but wrapped for API compatibility
+//!
+//! ## Buffer Management
+//!
+//! Sinks have configurable buffers (memory or disk). Buffers are reused across
+//! reloads to preserve in-flight data.
+//! Disk buffers are identified by name so that if the same sink is reloaded
+//! with the same configuration, we can reuse the existing buffer.
+//!
+//! ## Utilization Tracking
+//!
+//! The topology tracks component CPU utilization, which is used for
+//! autoscaling decisions and monitoring.
+
 use std::{
     collections::HashMap,
     future::ready,
