@@ -1,3 +1,109 @@
+//! A type that can be represented in a Vector configuration.
+//!
+//! In Vector, we want to be able to generate a schema for our configuration such that we can have a Rust-agnostic
+//! definition of exactly what is configurable, what values are allowed, what bounds exist, and so on and so forth.
+//!
+//! `Configurable` provides the machinery to allow describing and encoding the shape of a type, recursively, so that by
+//! instrumenting all transitive types of the configuration, the schema can be discovered by generating the schema from
+//! some root type.
+//!
+//! # Schema Generation
+//!
+//! The primary use case for `Configurable` is generating JSON Schema for:
+//! - Configuration validation (catch invalid configs before runtime)
+//! - Documentation generation (auto-generate component docs for vector.dev)
+//! - IDE integration (autocomplete, type checking in editors)
+//! - API schema exposure (GraphQL API knows all configurable options)
+//!
+//! # Implementing Configurable
+//!
+//! Most types derive `Configurable` automatically:
+//!
+//! ```ignore
+//! #[derive(Configurable)]
+//! struct MyConfig {
+//!     /// This field's description becomes part of the schema
+//!     #[configurable(description = "The number of items to process")]
+//!     count: usize,
+//! }
+//! ```
+//!
+//! For complex types (external types, types with generics, etc.),
+//! manual implementations are needed:
+//!
+//! ```ignore
+//! impl Configurable for String {
+//!     fn referenceable_name() -> Option<&'static str> {
+//!         Some("std::string")  // Unique identifier for this type
+//!     }
+//!     
+//!     fn generate_schema(_: &RefCell<SchemaGenerator>) -> Result<SchemaObject, GenerateError> {
+//!         // Generate JSON Schema for a string type
+//!         Ok(SchemaObject::string())
+//!     }
+//! }
+//! ```
+//!
+//! # Referenceable Names
+//!
+//! When a type has a `referenceable_name()`, it becomes a reusable schema definition:
+//!
+//! ```json
+//! {
+//!   "$ref": "#/definitions/std::string",
+//!   "type": "string"
+//! }
+//! ```
+//!
+//! Instead of inlining the schema everywhere the type is used, we define
+//! it once and reference it by name. This:
+//! - Reduces schema size (avoid duplication)
+//! - Enables schema evolution (update in one place, affects all uses)
+//! - Makes schemas more readable (named sections vs inline definitions)
+//!
+//! # Metadata
+//!
+//! Every configurable type has associated metadata:
+//!
+//! ```ignore
+//! let mut metadata = Metadata::default();
+//! metadata.set_description("The number of items to process");
+//! metadata.add_custom_attribute(CustomAttribute::kv("docs::examples", 10));
+//! ```
+//!
+//! Metadata captures:
+//! - Description (becomes schema description)
+//! - Title (becomes schema title)
+//! - Custom attributes (used for documentation, validation, etc.)
+//! - Default values
+//! - Validation rules
+//!
+//! # The ConfigurableRef Pattern
+//!
+//! Sometimes we need to pass around a "reference" to a configurable type without
+//! having the actual type. This is what `ConfigurableRef` provides:
+//!
+//! ```ignore
+//! pub struct ConfigurableRef {
+//!     type_name: fn() -> &'static str,
+//!     referenceable_name: fn() -> Option<&'static str>,
+//!     make_metadata: fn() -> Metadata,
+//!     validate_metadata: fn(&Metadata) -> Result<(), GenerateError>,
+//!     generate_schema: fn(&RefCell<SchemaGenerator>) -> Result<SchemaObject, GenerateError>,
+//! }
+//! ```
+//!
+//! This is essentially a vtable of function pointers. It allows:
+//! - Storing heterogeneous types in collections
+//! - Late binding (schema generation on demand)
+//! - Avoiding monomorphization (no generic explosion)
+//!
+//! **Why not just use trait objects?**
+//!
+//! Trait objects (`Box<dyn Trait>`) require the type to be behind a pointer.
+//! `ConfigurableRef` is a small, stack-allocated struct that just holds function pointers.
+//! This is more efficient when you only need to call trait methods (not store the whole type).
+
 #![deny(missing_docs)]
 
 use std::cell::RefCell;

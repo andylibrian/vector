@@ -1,3 +1,148 @@
+//! Configuration compiler: transforms ConfigBuilder → Config.
+//!
+//! This module implements the validation and compilation pipeline that converts a mutable,
+//! unvalidated `ConfigBuilder` into an immutable, validated `Config`.
+//!
+//! # The Compilation Pipeline
+//!
+//! ```text
+//! ConfigBuilder (mutable, strings for inputs)
+//!     ↓
+//! 1. Check component names (no dots)
+//!     ↓
+//! 2. Expand glob patterns in inputs
+//!     ↓
+//! 3. Check config shape (non-empty, no duplicates)
+//!     ↓
+//! 4. Check resources (port and other exclusive resource conflicts)
+//!     ↓
+//! 5. Check outputs (no reserved names)
+//!     ↓
+//! 6. Check values (numeric ranges, EWMA parameters)
+//!     ↓
+//! 7. Build graph (resolve string inputs → OutputIds)
+//!     ↓
+//! 8. Typecheck graph (log/metric/trace compatibility)
+//!     ↓
+//! 9. Check for cycles
+//!     ↓
+//! 10. Propagate acknowledgements
+//!     ↓
+//! Config (immutable, OutputIds for inputs)
+//! ```
+//!
+//! Each step can add errors. We collect errors across stages and return them
+//! together when possible, so users can fix multiple issues in one pass.
+//!
+//! # Input Resolution: String → OutputId
+//!
+//! The most complex step is converting string inputs to OutputId references.
+//!
+//! **In ConfigBuilder:**
+//! ```yaml
+//! sinks:
+//!   my_sink:
+//!     inputs: ["my_source", "my_transform"]
+//! ```
+//!
+//! These are just strings. We don't know if they're valid.
+//!
+//! **In Config:**
+//! ```rust
+//! SinkOuter {
+//!     inputs: vec![
+//!         OutputId { component: "my_source", port: None },
+//!         OutputId { component: "my_transform", port: None },
+//!     ]
+//! }
+//! ```
+//!
+//! The graph construction (step 7) performs this resolution:
+//!
+//! 1. Collect all valid outputs (from sources and transforms)
+//! 2. Build a map: string → OutputId
+//! 3. For each sink/transform input, look up the string in the map
+//! 4. If found, replace with OutputId; if not, error
+//!
+//! This is why graph construction can fail - an input might reference
+//! a non-existent component.
+//!
+//! # Glob Expansion
+//!
+//! Inputs can use glob patterns:
+//!
+//! ```yaml
+//! sinks:
+//!   all_logs:
+//!     inputs: ["log_*"]  # Matches log_source1, log_source2, etc.
+//! ```
+//!
+//! The `expand_globs()` function:
+//! 1. Collects all valid output IDs as strings
+//! 2. For each input pattern, tries to match as a glob
+//! 3. If pattern matches, expands to all matching outputs
+//! 4. If pattern doesn't match anything, leaves as-is (for better error messages)
+//!
+//! **Why leave non-matching patterns?**
+//!
+//! If we remove unmatched patterns, the error would be "no inputs".
+//! If we leave them, the error is "input 'nonexistent' doesn't match any components".
+//! The second is more helpful - it tells you WHICH input is wrong.
+//!
+//! # Enrichment Tables: Dual Components
+//!
+//! Enrichment tables can generate BOTH a source and a sink:
+//!
+//! ```yaml
+//! enrichment_tables:
+//!   memory_table:
+//!     type: memory
+//!     inputs: ["some_source"]  # Needs a sink to write to the table
+//!     source_config:           # Creates a source to read from the table
+//!       source_key: "memory_table_source"
+//! ```
+//!
+//! The compiler handles this by:
+//! 1. Extracting both derived components
+//! 2. Adding them to the relevant collections
+//! 3. Including them in graph construction
+//!
+//! This is why we have `sources_and_table_sources` and `all_sinks` variables.
+//!
+//! # Acknowledgement Propagation
+//!
+//! End-to-end acknowledgements work by propagating settings from sinks back to sources:
+//!
+//! ```yaml
+//! sinks:
+//!   kafka:
+//!     type: kafka
+//!     acknowledgements:
+//!       enabled: true
+//! ```
+//!
+//! The compiler traces the dependency chain:
+//! 1. Find all sinks with acknowledgements enabled
+//! 2. For each, walk backwards through inputs
+//! 3. Mark all source ancestors with `sink_acknowledgements: true`
+//!
+//! This ensures sources know to wait for confirmation before advancing their read position.
+//!
+//! # Why This Order?
+//!
+//! **Name checking before glob expansion:**
+//! Glob expansion might create components with dots (e.g., `route.errors`).
+//! We want to catch user-defined dotted names BEFORE expansion.
+//!
+//! **Shape checking before graph construction:**
+//! Graph construction is expensive. We want to fail fast if the config is missing sources/sinks.
+//!
+//! **Graph construction before type checking:**
+//! Type checking needs the graph to know what types flow where.
+//!
+//! **All checks before acknowledgement propagation:**
+//! Acknowledgement propagation modifies the config. We want the config fully validated first.
+
 use indexmap::{IndexMap, IndexSet};
 use vector_lib::id::Inputs;
 

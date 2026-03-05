@@ -16,6 +16,113 @@
 //! 4. **Secret resolution**: Secret backends are queried for sensitive values
 //! 5. **Provider resolution**: Remote config providers (if configured) are contacted
 //! 6. **Compilation**: ConfigBuilder is compiled into a validated Config
+//!
+//! # Environment Variable Interpolation
+//!
+//! Vector supports referencing environment variables in config files:
+//!
+//! ```yaml
+//! sources:
+//!   http_source:
+//!     type: http_server
+//!     address: "${HTTP_BIND_ADDRESS:-0.0.0.0:8080}"
+//! ```
+//!
+//! **Syntax:**
+//! - `${VAR}` - Required variable (error if not set)
+//! - `${VAR:-default}` - Optional with default value
+//! - `${VAR:?error message}` - Required with custom error message
+//!
+//! This is implemented by the `vars::interpolate()` function, which uses a regex
+//! to find and replace `${...}` patterns before parsing. This happens BEFORE
+//! deserialization, so the YAML parser sees the final values.
+//!
+//! **Why before parsing?**
+//! - Type information isn't available yet (we're just processing strings)
+//! - The YAML parser needs valid values to deserialize
+//! - Allows interpolating into any field type (strings, numbers, arrays)
+//!
+//! # Secret Backend Resolution
+//!
+//! Sensitive values can be retrieved from external secret stores:
+//!
+//! ```yaml
+//! secret:
+//!   my_vault:
+//!     type: exec
+//!     command: ["/usr/local/bin/vault-helper", "read"]
+//!
+//! sinks:
+//!   my_sink:
+//!     type: http
+//!     auth:
+//!       token: "SECRET[my_vault.database/password]"
+//! ```
+//!
+//! Secret resolution happens AFTER parsing but BEFORE validation:
+//! 1. Config is parsed with `SECRET[...]` placeholders intact
+//! 2. Each secret backend is queried to resolve its placeholders
+//! 3. Placeholders are replaced with actual secret values
+//! 4. Validation runs on the fully-resolved config
+//!
+//! This two-phase approach ensures:
+//! - Secret backends can use config values (e.g., endpoint URLs)
+//! - Validation sees the final values (e.g., can check if a password is valid)
+//! - Secrets aren't leaked in error messages from the parser
+//!
+//! # Configuration Providers
+//!
+//! Vector can load config from remote sources (e.g., Consul, etcd):
+//!
+//! ```yaml
+//! provider:
+//!   type: consul
+//!   endpoint: "http://localhost:8500"
+//!   keys: ["vector/config"]
+//! ```
+//!
+//! When a provider is configured, the local config file acts as "bootstrap":
+//! 1. Local config is parsed to get provider settings
+//! 2. Provider is contacted to fetch the actual config
+//! 3. Fetched config REPLACES the local config (not merged)
+//!
+//! This is why `check_provider()` validates that providers and components
+//! can't coexist in the same config - it would be ambiguous which to use.
+//!
+//! # Path Expansion
+//!
+//! The `process_paths()` function handles three scenarios:
+//!
+//! 1. **Explicit paths**: `--config /etc/vector/main.yaml`
+//! 2. **Glob patterns**: `--config "/etc/vector/*.yaml"`
+//! 3. **Directories**: `--config-dir /etc/vector.d/`
+//!
+//! For globs, the `glob` crate expands patterns to actual file paths.
+//! For directories, the loader reads root files and known component paths
+//! (with recursive traversal for transform namespaces).
+//! All paths are deduplicated and sorted for deterministic behavior.
+//!
+//! **Why store paths globally?**
+//! The `CONFIG_PATHS` static is used by:
+//! - The watcher to know which files to monitor for changes
+//! - The API to report which configs are in use
+//! - The reload logic to re-read the same files
+//!
+//! # Loader Pattern
+//!
+//! The module uses a "builder-style loader" pattern:
+//!
+//! ```ignore
+//! let config = ConfigBuilderLoader::default()
+//!     .interpolate_env(true)
+//!     .allow_empty(false)
+//!     .secrets(secret_map)
+//!     .load_from_paths(&paths)?;
+//! ```
+//!
+//! Each method configures the loader, then `load_from_paths()` performs
+//! the actual work. This allows composing different loading behaviors
+//! without exploding the number of function parameters.
 
 mod config_builder;
 mod loader;

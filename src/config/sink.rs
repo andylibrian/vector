@@ -22,6 +22,168 @@
 //! 1. Create a config struct implementing `SinkConfig`
 //! 2. Implement `build()` to create the sink runtime
 //! 3. Define input type requirements (logs, metrics, or both)
+//!
+//! # The Buffer System
+//!
+//! Every sink has an associated buffer, configured via `BufferConfig`:
+//!
+//! ```yaml
+//! sinks:
+//!   my_sink:
+//!     type: http
+//!     inputs: ["my_source"]
+//!     buffer:
+//!       type: disk
+//!       max_size: 104900000  # 100MB
+//!       when_full: block
+//! ```
+//!
+//! **Why buffers exist:**
+//!
+//! Sinks send data to external systems, which have varying throughput:
+//! - Local file: Very fast
+//! - Cloud service: Network latency, rate limits
+//! - Database: Query overhead, connection limits
+//!
+//! Without buffers:
+//! 1. Slow sink would block upstream transforms/sources
+//! 2. Backpressure would propagate through the entire pipeline
+//! 3. Fast sources would be throttled by slow sinks
+//!
+//! With buffers:
+//! 1. Fast sources write to buffer (fast)
+//! 2. Buffer absorbs temporary slowdowns
+//! 3. Slow sink drains buffer at its own pace
+//! 4. Buffer full? Apply configured strategy (block/drop)
+//!
+//! **Buffer types:**
+//!
+//! - `Memory`: Fast, but data lost on restart, limited by RAM
+//! - `DiskV2`: Persistent, survives restarts, limited by disk space
+//!
+//! **Resource conflicts:**
+//!
+//! Disk buffers claim a unique resource:
+//! ```ignore
+//! fn resources(&self, id: &ComponentKey) -> Vec<Resource> {
+//!     vec![Resource::DiskBuffer(id.to_string())]
+//! }
+//! ```
+//!
+//! This prevents two sinks from writing to the same buffer file, which
+//! would corrupt data.
+//!
+//! # Health Checks
+//!
+//! Sinks can verify connectivity before Vector becomes "ready":
+//!
+//! ```yaml
+//! sinks:
+//!   my_sink:
+//!     type: http
+//!     healthcheck:
+//!       enabled: true
+//!       uri: "http://api.example.com/health"
+//!       timeout: 10s
+//! ```
+//!
+//! When `--require-healthy` is set:
+//! 1. Vector builds all components
+//! 2. Runs health checks for all sinks with `healthcheck.enabled = true`
+//! 3. If ANY health check fails, Vector exits with an error
+//! 4. If ALL health checks pass, Vector enters running state
+//!
+//! This ensures misconfigured sinks are caught before accepting traffic.
+//!
+//! # Acknowledgements (End-to-End Delivery)
+//!
+//! Sinks can enable acknowledgements to provide delivery guarantees:
+//!
+//! ```yaml
+//! sinks:
+//!   kafka_sink:
+//!     type: kafka
+//!     acknowledgements:
+//!       enabled: true
+//! ```
+//!
+//! **How it works:**
+//!
+//! 1. Source receives an event (e.g., from a file)
+//! 2. Event flows through transforms to the sink
+//! 3. Sink sends event to Kafka and waits for confirmation
+//! 4. Confirmation propagates back to the source
+//! 5. Source marks the file offset as "processed"
+//!
+//! If Vector crashes mid-pipeline:
+//! - Without acks: Events in-flight are lost, source already advanced
+//! - With acks: Source hasn't advanced, events are replayed on restart
+//!
+//! **The propagation chain:**
+//!
+//! ```ignore
+//! // In config/mod.rs
+//! fn propagate_acknowledgements(&mut self) {
+//!     // Find sinks with acks enabled
+//!     for sink in self.sinks.values().filter(|s| s.acknowledgements().enabled()) {
+//!         // Trace back to sources
+//!         for input in sink.inputs {
+//!             self.propagate_acks_rec(input);
+//!         }
+//!     }
+//! }
+//! ```
+//!
+//! This is why sources have a `sink_acknowledgements` field - it's set
+//! automatically during validation, not by the user.
+//!
+//! # Input Type Constraints
+//!
+//! Sinks declare what event types they accept:
+//!
+//! ```ignore
+//! impl SinkConfig for HttpSinkConfig {
+//!     fn input(&self) -> Input {
+//!         Input::log()  // Only accepts log events
+//!     }
+//! }
+//!
+//! impl SinkConfig for PrometheusSinkConfig {
+//!     fn input(&self) -> Input {
+//!         Input::metric()  // Only accepts metrics
+//!     }
+//! }
+//!
+//! impl SinkConfig for ConsoleSinkConfig {
+//!     fn input(&self) -> Input {
+//!         Input::any()  // Accepts logs, metrics, or traces
+//!     }
+//! }
+//! ```
+//!
+//! The graph validator ensures type compatibility during config compilation.
+//!
+//! # The SinkContext
+//!
+//! When building a sink, Vector provides runtime dependencies:
+//!
+//! ```ignore
+//! pub struct SinkContext {
+//!     pub healthcheck: SinkHealthcheckOptions,  // Health check config
+//!     pub globals: GlobalOptions,               // Global config
+//!     pub enrichment_tables: TableRegistry,     // Lookup tables
+//!     pub proxy: ProxyConfig,                   // HTTP proxy settings
+//!     pub app_name: String,                     // "vector" (for User-Agent)
+//! }
+//! ```
+//!
+//! This is passed to `SinkConfig::build()`, which returns:
+//! ```ignore
+//! async fn build(&self, cx: SinkContext) -> Result<(VectorSink, Healthcheck)>;
+//! ```
+//!
+//! - `VectorSink`: The running sink instance
+//! - `Healthcheck`: A future that verifies connectivity
 
 use std::{cell::RefCell, path::PathBuf, time::Duration};
 

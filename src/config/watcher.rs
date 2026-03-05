@@ -1,4 +1,223 @@
-use notify::{EventKind, RecursiveMode, recommended_watcher};
+//! Configuration file watcher for hot reload.
+//!
+//! This module implements file system monitoring to detect when Vector's
+//! configuration files change, triggering automatic reload without restart.
+//!
+//! # Hot Reload Architecture
+//!
+//! ```text
+//! File System
+//!     ↓ (inotify/FSEvents/kqueue)
+//! Watcher Thread (this module)
+//!     ↓ (SignalTo::ReloadFromDisk)
+//! Signal Channel
+//!     ↓ (broadcast)
+//! Main Loop
+//!     ↓ (loads new config, computes diff)
+//! Topology Controller
+//!     ↓ (applies diff, restarts affected components)
+//! Running Topology (updated)
+//! ```
+//!
+//! # Watcher Types
+//!
+//! **RecommendedWatcher** (default):
+//! - Linux: Uses inotify (kernel-level file monitoring)
+//! - macOS: Uses FSEvents or kqueue
+//! - Windows: Uses ReadDirectoryChangesW
+//! - **Pros**: Immediate notification, low CPU usage
+//! - **Cons**: Doesn't work on network filesystems (NFS, SMB)
+//!
+//! **PollWatcher** (fallback):
+//! - Checks files at regular intervals (configurable)
+//! - Works on any filesystem, including network mounts
+//! - **Pros**: Universal compatibility
+//! - **Cons**: Higher latency (poll interval), higher CPU (constant polling)
+//!
+//! Use PollWatcher when:
+//! - Config files are on NFS/SMB
+//! - inotify isn't available (containers with limited capabilities)
+//! - RecommendedWatcher is failing for unknown reasons
+//!
+//! # Event Coalescing
+//!
+//! When you save a file in your editor, it might trigger multiple events:
+//!
+//! ```text
+//! t=0.00s: CREATE /tmp/config.yaml.tmp
+//! t=0.01s: MODIFY /tmp/config.yaml.tmp (write data)
+//! t=0.02s: MODIFY /tmp/config.yaml.tmp (sync)
+//! t=0.03s: RENAME /tmp/config.yaml.tmp → config.yaml
+//! t=0.04s: MODIFY config.yaml (final write)
+//! ```
+//!
+//! **The problem:**
+//! - Reloading after each event would trigger 5 reloads
+//! - Early reloads would read incomplete/truncated files
+//! - Wastes CPU on redundant config parsing
+//!
+//! **The solution - delay buffer:**
+//! ```ignore
+//! let delay = Duration::from_secs(1);
+//!
+//! // First event arrives
+//! let mut changed_paths = event.paths;
+//!
+//! // Wait for "quiet period"
+//! while let Ok(event) = receiver.recv_timeout(delay) {
+//!     changed_paths.extend(event.paths);  // Accumulate all changes
+//! }
+//!
+//! // Only reload once after 1s of silence
+//! signal_tx.send(SignalTo::ReloadFromDisk)?;
+//! ```
+//!
+//! This ensures we reload only once per "batch" of changes, and only after
+//! the file has stabilized.
+//!
+//! # macOS Special Case
+//!
+//! The notify library documentation recommends a delay > 30 seconds on macOS
+//! due to FSEvents behavior. However:
+//!
+//! 1. Vector's reload logic is idempotent (same config → no changes)
+//! 2. Config parsing is fast (milliseconds)
+//! 3. Users expect responsive hot reload (30s is too slow)
+//!
+//! We use a 1-second delay as a pragmatic balance:
+//! - Fast enough to feel responsive
+//! - Long enough to avoid most duplicate events
+//! - Safe even if duplicates occur (idempotent reload)
+//!
+//! # Path Re-registration
+//!
+//! Some file editors (vim, emacs) use "atomic save":
+//!
+//! ```text
+//! 1. Write to new temp file
+//! 2. Rename: config.yaml → config.yaml.bak
+//! 3. Rename: temp → config.yaml
+//! ```
+//!
+//! **The problem:**
+//!
+//! Inotify watches INODES, not paths. When a file is renamed/deleted, the
+//! watcher loses track of the original path. Future changes to the new file
+//! won't be detected.
+//!
+//! **The solution:**
+//!
+//! After every reload, re-register paths with the watcher:
+//! ```ignore
+//! // Reload config
+//! signal_tx.send(SignalTo::ReloadFromDisk)?;
+//!
+//! // Re-register paths to handle inode changes
+//! watcher.add_paths(&config_paths)?;
+//! ```
+//!
+//! This ensures the watcher tracks the CURRENT inode, even after atomic saves.
+//!
+//! # Component-Specific Reload
+//!
+//! Some components have external config files (e.g., TLS certificates):
+//!
+//! ```yaml
+//! sinks:
+//!   https_sink:
+//!     type: http
+//!     tls:
+//!       crt_file: /etc/tls/server.crt  # Watched separately
+//!       key_file: /etc/tls/server.key  # Watched separately
+//! ```
+//!
+//! When these files change, we don't reload the ENTIRE config - just the
+//! affected component:
+//!
+//! ```ignore
+//! if changed_paths.contains(&tls_cert_path) {
+//!     signal_tx.send(SignalTo::ReloadComponents(
+//!         vec!["https_sink".into()]
+//!     ))?;
+//! }
+//! ```
+//!
+//! This is tracked via `ComponentConfig`:
+//!
+//! ```ignore
+//! pub struct ComponentConfig {
+//!     pub config_paths: Vec<PathBuf>,      // Files this component watches
+//!     pub component_key: ComponentKey,     // Component to reload
+//!     pub component_type: ComponentType,   // Source/Transform/Sink
+//! }
+//! ```
+//!
+//! # Enrichment Table Reload
+//!
+//! Enrichment tables can be updated independently:
+//!
+//! ```yaml
+//! enrichment_tables:
+//!   geoip:
+//!     type: geoip
+//!     path: /etc/geoip/GeoLite2-City.mmdb
+//! ```
+//!
+//! When the GeoIP database changes:
+//! 1. Watcher detects change to `/etc/geoip/GeoLite2-City.mmdb`
+//! 2. Sends `SignalTo::ReloadEnrichmentTables`
+//! 3. Topology reloads ONLY enrichment tables
+//! 4. Running components continue without interruption
+//!
+//! This is much faster than a full reload (no component restart).
+//!
+//! # Watcher Thread Lifecycle
+//!
+//! The watcher runs in a separate thread:
+//!
+//! ```ignore
+//! thread::spawn(move || {
+//!     loop {
+//!         // Wait for events
+//!         while let Ok(event) = receiver.recv() {
+//!             // Coalesce changes
+//!             // Send reload signal
+//!             // Re-register paths
+//!         }
+//!         
+//!         // If watcher fails, retry after delay
+//!         thread::sleep(RETRY_TIMEOUT);
+//!         watcher = create_watcher(&watcher_conf, &config_paths);
+//!         
+//!         // Speculative reload (might have missed changes)
+//!         signal_tx.send(SignalTo::ReloadFromDisk)?;
+//!     }
+//! });
+//! ```
+//!
+//! **Why retry indefinitely?**
+//!
+//! The watcher thread must never die:
+//! - It's the ONLY way to detect config changes
+//! - If it dies, hot reload stops working silently
+//! - Better to keep retrying than give up
+//!
+//! **Why speculative reload after reconnect?**
+//!
+//! If the watcher was down for 10 seconds, files might have changed during
+//! that time. We send a reload signal to catch any missed changes. The reload
+//! logic is idempotent, so this is safe even if nothing changed.
+//!
+//! # Signal Types
+//!
+//! The watcher sends different signals based on what changed:
+//!
+//! - `ReloadFromDisk`: Full config reload (config files changed)
+//! - `ReloadComponents(keys)`: Partial reload (component files changed)
+//! - `ReloadEnrichmentTables`: Enrichment table reload only
+//!
+//! Each signal type triggers a different reload path in the topology controller,
+//! minimizing disruption based on the scope of changes.
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -6,6 +225,8 @@ use std::{
     thread,
     time::Duration,
 };
+
+use notify::{EventKind, RecursiveMode, recommended_watcher};
 
 use crate::{
     Error,

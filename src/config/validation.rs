@@ -1,3 +1,236 @@
+//! Configuration validation logic.
+//!
+//! This module implements validation checks used during compilation and
+//! post-compilation preflight checks. These checks catch configuration errors
+//! early, providing clear error messages instead of cryptic runtime failures.
+//!
+//! # Validation Layers
+//!
+//! Vector validates configs at multiple stages:
+//!
+//! 1. **Parsing validation** (serde): YAML syntax, field types
+//! 2. **Shape validation** (this module): Component counts, duplicate names
+//! 3. **Resource validation** (this module): Port/resource conflicts
+//! 4. **Value validation** (this module): Config value ranges, formats
+//! 5. **Output validation** (this module): Reserved names, transform validity
+//! 6. **Graph validation** (graph.rs): Cycles, type compatibility
+//! 7. **Post-compilation checks** (this module): Disk buffer mountpoint capacity
+//!
+//! Each layer catches different classes of errors, and all must pass before
+//! the config is accepted.
+//!
+//! # Shape Validation (`check_shape`)
+//!
+//! Validates the overall structure of the config:
+//!
+//! **Non-empty check:**
+//! ```ignore
+//! if config.sources.is_empty() {
+//!     errors.push("No sources defined in the config.");
+//! }
+//! if config.sinks.is_empty() {
+//!     errors.push("No sinks defined in the config.");
+//! }
+//! ```
+//!
+//! **Why require at least one source and sink?**
+//!
+//! A config without sources produces no data. A config without sinks discards
+//! all data. Both are almost certainly user errors (typo in YAML, etc.).
+//!
+//! **Exception:** `allow_empty` flag for programmatic config construction
+//! (e.g., in tests or when using providers).
+//!
+//! **Duplicate name check:**
+//! ```ignore
+//! let mut used_keys = HashMap::new();
+//! for (ctype, id) in sources.chain(transforms).chain(sinks) {
+//!     used_keys.entry(id).or_default().push(ctype);
+//! }
+//! // Error if any key has multiple uses
+//! ```
+//!
+//! **Why can't sources and sinks share names?**
+//!
+//! Component names are used in:
+//! - Metrics: `component_name="my_source"` tag
+//! - Logs: `source_id="my_source"` field
+//! - API: `/api/components/my_source` endpoint
+//!
+//! Ambiguous names would make these unusable.
+//!
+//! **Empty/duplicate inputs:**
+//! ```yaml
+//! transforms:
+//!   bad1:
+//!     inputs: []           # Error: no inputs
+//!   bad2:
+//!     inputs: ["a", "a"]   # Error: duplicate input
+//! ```
+//!
+//! Empty inputs mean no data flows in (pointless transform).
+//! Duplicate inputs waste processing (same event processed twice).
+//!
+//! # Resource Validation (`check_resources`)
+//!
+//! Detects exclusive resource conflicts BEFORE runtime:
+//!
+//! ```yaml
+//! sources:
+//!   http1:
+//!     type: http_server
+//!     address: "0.0.0.0:8080"
+//!   http2:
+//!     type: http_server
+//!     address: "0.0.0.0:8080"  # ERROR: Port already in use
+//! ```
+//!
+//! **The unspecified address problem:**
+//!
+//! Binding to `0.0.0.0:8080` means "listen on ALL interfaces on port 8080".
+//! This conflicts with binding to `192.168.1.1:8080` because the first bind
+//! already grabbed port 8080 on that specific interface.
+//!
+//! The `Resource::conflicts()` method handles this edge case:
+//! ```ignore
+//! if address.ip().is_unspecified() {
+//!     // 0.0.0.0:8080 conflicts with ANY bind on port 8080
+//! }
+//! ```
+//!
+//! **Why validate at config time, not runtime?**
+//!
+//! Runtime detection:
+//! - First component starts successfully
+//! - Second component fails with "Address already in use"
+//! - Partial topology running, confusing error message
+//!
+//! Config-time detection:
+//! - Clear error: "Port 8080 claimed by http1 and http2"
+//! - No components started
+//! - User knows exactly what to fix
+//!
+//! # Disk Buffer Validation (`check_buffer_preconditions`)
+//!
+//! Ensures disk buffers fit on their mountpoints:
+//!
+//! ```yaml
+//! sinks:
+//!   big_sink:
+//!     type: http
+//!     buffer:
+//!       type: disk
+//!       max_size: 107374182400  # 100GB
+//! ```
+//!
+//! If the disk has only 50GB free, this config would fail at runtime.
+//! We check this at startup to fail fast with a clear message.
+//!
+//! **The algorithm:**
+//!
+//! 1. Query system mountpoints and their capacities
+//! 2. For each disk buffer, find which mountpoint it lives on
+//! 3. Sum `max_size` of all buffers on each mountpoint
+//! 4. Error if sum exceeds mountpoint capacity
+//!
+//! **Why check capacity, not free space?**
+//!
+//! We can't control what else uses the disk (other processes, logs, etc.).
+//! Checking total capacity ensures Vector's MAXIMUM theoretical usage fits.
+//! Operators must ensure free space stays above Vector's needs.
+//!
+//! # Value Validation (`check_values`)
+//!
+//! Validates that config values are within acceptable ranges:
+//!
+//! ```ignore
+//! // EWMA (Exponential Weighted Moving Average) parameters
+//! if alpha <= 0.0 || alpha >= 1.0 {
+//!     return Err("EWMA alpha must be 0 < alpha < 1");
+//! }
+//! ```
+//!
+//! **Why these constraints?**
+//!
+//! EWMA alpha controls smoothing:
+//! - alpha = 0.9: Strong preference for new values (jittery)
+//! - alpha = 0.1: Strong preference for old values (smooth)
+//! - alpha = 0: Division by zero (undefined)
+//! - alpha = 1: No smoothing at all (defeats the purpose)
+//!
+//! These are mathematical constraints, not arbitrary limits.
+//!
+//! # Output Validation (`check_outputs`)
+//!
+//! Prevents reserved output names:
+//!
+//! ```ignore
+//! const DEFAULT_OUTPUT: &str = "output";
+//!
+//! if transform.outputs().any(|o| o.port == Some(DEFAULT_OUTPUT)) {
+//!     return Err("Cannot use reserved output name: 'output'");
+//! }
+//! ```
+//!
+//! **Why is "output" reserved?**
+//!
+//! Metrics use an `output` tag to distinguish between named outputs:
+//! ```
+//! events_processed{output="errors"} = 100
+//! events_processed{output="output"} = 500  # Default output
+//! ```
+//!
+//! If a user named their output "output", it would collide with the default
+//! output tag, breaking metrics and dashboards.
+//!
+//! # Provider Validation (`check_provider`)
+//!
+//! Ensures configs don't mix providers with direct components:
+//!
+//! ```yaml
+//! # INVALID: Can't have both provider and components
+//! provider:
+//!   type: consul
+//!   endpoint: "http://localhost:8500"
+//!
+//! sources:
+//!   my_source:
+//!     type: file
+//! ```
+//!
+//! **Why this restriction?**
+//!
+//! When a provider is configured:
+//! 1. Local config is parsed to get provider settings
+//! 2. Provider fetches the ACTUAL config from remote
+//! 3. Fetched config REPLACES local config
+//!
+//! If we allowed local components AND a provider, it would be unclear:
+//! - Should local components be merged with fetched config?
+//! - Or should fetched config replace everything?
+//!
+//! The restriction makes the semantics clear: provider means "everything from remote".
+//!
+//! # Warnings (`warnings`)
+//!
+//! Some issues are warnings, not errors:
+//!
+//! ```ignore
+//! // Source with no consumers
+//! if !config.transforms.any(|t| t.inputs.contains(&source))
+//!    && !config.sinks.any(|s| s.inputs.contains(&source)) {
+//!     warnings.push("Source has no consumers");
+//! }
+//! ```
+//!
+//! **Why warn instead of error?**
+//!
+//! This might be intentional:
+//! - Source exists for a test that hasn't run yet
+//! - Sink was temporarily removed for debugging
+//! - Config is a partial template
+//!
+//! Warnings inform without blocking. Users can decide if it's a problem.
 use std::{collections::HashMap, path::PathBuf};
 
 use futures_util::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, stream};

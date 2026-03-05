@@ -8,21 +8,107 @@
 //!
 //! # Architecture Overview
 //!
-//! The configuration system follows a builder pattern:
-//! 1. `ConfigBuilder` - Mutable, used during parsing and construction
-//! 2. `Config` - Immutable, validated, ready for topology building
+//! The configuration system follows a builder pattern with two main phases:
 //!
-//! The compiler module (`compiler.rs`) handles validation and transformation
-//! from `ConfigBuilder` to `Config`, including:
-//! - Resolving component references (inputs/outputs)
-//! - Detecting cycles in the DAG
-//! - Validating resource conflicts (ports, file descriptors)
+//! **Phase 1: Construction (ConfigBuilder)**
+//! - Mutable representation during parsing and construction
+//! - Component inputs are still strings (e.g., "my_source")
+//! - Multiple config files are merged at this stage
+//! - No validation happens yet - we're just collecting components
+//!
+//! **Phase 2: Compilation (Config)**
+//! - Immutable, validated, ready for topology building
+//! - Component inputs are resolved to `OutputId` references
+//! - Full validation runs: cycles, types, resources
+//! - The topology builder can directly use this to build running components
+//!
+//! # Why Two Phases?
+//!
+//! The split is necessary because:
+//! 1. Multi-file configs: A sink in one file might reference a source in another file.
+//!    We need to load all files first, then validate the combined config.
+//! 2. Reference resolution: We can't resolve "inputs: [my_source]" until we know all sources exist.
+//! 3. Atomic validation: Better to fail with all errors at once than partially start the topology.
 //!
 //! # Hot Reload Support
 //!
 //! Vector supports hot reloading configuration via `ConfigDiff`, which computes
 //! the minimal set of changes needed between old and new configs. This enables
 //! zero-downtime updates where only affected components are restarted.
+//!
+//! **How it works:**
+//! 1. Config file changes are detected by the watcher (see `watcher.rs`)
+//! 2. New config is loaded and validated
+//! 3. `ConfigDiff::new(old, new)` compares serialized configs
+//! 4. Only components in `to_add`, `to_remove`, or `to_change` are affected
+//! 5. Running components not in the diff continue without interruption
+//!
+//! # Component Registration
+//!
+//! Components register themselves using the `#[typetag::serde]` attribute:
+//! ```ignore
+//! #[typetag::serde(name = "file")]
+//! impl SourceConfig for FileConfig { ... }
+//! ```
+//!
+//! This creates a global registry that maps `"file"` → `FileConfig`. When the config
+//! parser sees `type: "file"`, `typetag` looks up the registered type and deserializes
+//! the remaining fields into it. This is how Vector supports 120+ components
+//! without a giant match statement.
+//!
+//! # Key Types
+//!
+//! - `Config`: The final, validated configuration (immutable)
+//! - `ConfigBuilder`: The mutable builder (used during loading)
+//! - `ComponentKey`: Unique identifier for a component (e.g., "my_source")
+//! - `OutputId`: Reference to a component's output (component + optional port)
+//! - `Resource`: System resource that can't be shared (ports, file descriptors)
+//!
+//! # Module Organization
+//!
+//! - `mod.rs` (this file): Core `Config` struct and resource conflict detection
+//! - `builder.rs`: `ConfigBuilder` for mutable config construction
+//! - `compiler.rs`: Converts `ConfigBuilder` → `Config` with validation
+//! - `loading/mod.rs`: File discovery, parsing, and env var interpolation
+//! - `source.rs`: `SourceConfig` trait and `SourceOuter` wrapper
+//! - `transform.rs`: `TransformConfig` trait and `TransformOuter` wrapper
+//! - `sink.rs`: `SinkConfig` trait and `SinkOuter` wrapper
+//! - `graph.rs`: DAG validation (cycles, type compatibility)
+//! - `validation.rs`: Config-level validation (shape, resources, values)
+//! - `diff.rs`: `ConfigDiff` for hot reload change detection
+//! - `watcher.rs`: File system monitoring for config changes
+//!
+//! # Example Flow
+//!
+//! ```text
+//! User YAML file:
+//!   sources:
+//!     my_source:
+//!       type: file
+//!       include: ["/var/log/*.log"]
+//!   sinks:
+//!     my_sink:
+//!       type: console
+//!       inputs: ["my_source"]
+//!
+//! ↓ (loading/mod.rs: parse YAML)
+//!
+//! ConfigBuilder {
+//!   sources: {"my_source": SourceOuter { ... }},
+//!   sinks: {"my_sink": SinkOuter { inputs: ["my_source"], ... }}
+//! }
+//!
+//! ↓ (compiler.rs: validate + resolve)
+//!
+//! Config {
+//!   sources: {"my_source": SourceOuter { ... }},
+//!   sinks: {"my_sink": SinkOuter { inputs: [OutputId("my_source")], ... }}
+//! }
+//!
+//! ↓ (topology builder: spawn components)
+//!
+//! Running Vector instance
+//! ```
 
 #![allow(missing_docs)]
 use std::{
@@ -175,8 +261,35 @@ impl ConfigPath {
 /// This is the output of the configuration compiler. It represents a fully
 /// validated topology that can be handed to the topology builder.
 ///
-/// The component maps use `IndexMap` to preserve insertion order, which is
-/// important for deterministic config-to-config comparisons during hot reload.
+/// **Why IndexMap instead of HashMap?**
+///
+/// Component maps use `IndexMap` (not `HashMap`) for two critical reasons:
+///
+/// 1. **Deterministic ordering**: Components maintain insertion order.
+///    This is essential during hot reload - when computing `ConfigDiff`,
+///    we need to compare old vs new configs. If order wasn't stable, we might
+///    incorrectly detect changes just because iteration order changed.
+///
+/// 2. **Stable serialization**: `Serialize` implementation iterates in order.
+///    This means serialized configs are consistent across runs, which matters
+///    for diff computation and logging.
+///
+/// **The Two-Phase Flow:**
+///
+/// 1. Config files are parsed into `ConfigBuilder` (mutable, strings for inputs)
+/// 2. Builders are merged, validated, and compiled into `Config` (immutable, OutputIds)
+///
+/// This split is necessary because:
+/// - We need to load all config files before validating references
+/// - Component "A" in file 1 might reference component "B" in file 2
+/// - We can't validate until we have the complete picture
+///
+/// **What happens after `Config` is created?**
+///
+/// 1. The topology builder takes `Config` and builds running components
+/// 2. Each component is spawned as an async task
+/// 3. Components are wired together based on the `inputs` field
+/// 4. The topology controller manages their lifecycle (start, stop, reload)
 #[derive(Debug, Default, Serialize)]
 pub struct Config {
     #[cfg(feature = "api")]
@@ -367,15 +480,38 @@ impl Default for HealthcheckOptions {
 
 impl_generate_config_from_default!(HealthcheckOptions);
 
-/// Unique thing, like port, of which only one owner can be.
+/// Unique system resource that can only be owned by one component at a time.
 ///
-/// Resources are used to detect conflicts between components. For example,
-/// two sources can't both listen on the same TCP port. The config compiler
-/// uses this to fail early with a clear error message.
+/// Resources are used to detect conflicts between components during config validation.
+/// For example, two sources can't both listen on the same TCP port - this would
+/// cause a bind error at runtime. The config compiler checks for these conflicts
+/// early to provide clear error messages before starting the topology.
 ///
-/// The `DiskBuffer` variant is particularly important - disk buffers use
-/// file-based storage, and having two components write to the same buffer
-/// file would corrupt data.
+/// **Why this matters:**
+///
+/// Without resource conflict detection:
+/// 1. Config would appear valid
+/// 2. Topology would start building components
+/// 3. Second component would fail to bind to the port
+/// 4. Partial topology would be running, but broken
+/// 5. User gets confusing error message
+///
+/// With resource conflict detection:
+/// 1. Config validation catches the conflict
+/// 2. User gets clear error: "Port 8080 claimed by source_a and source_b"
+/// 3. Config is rejected before any components start
+///
+/// **Special case: Unspecified addresses (0.0.0.0 or ::)**
+///
+/// Binding to 0.0.0.0:8080 means "bind to ALL network interfaces".
+/// This conflicts with binding to 192.168.1.1:8080 because the unspecified
+/// binding is already listening on that specific interface. The `conflicts()`
+/// method handles this edge case correctly.
+///
+/// **DiskBuffer variant:**
+///
+/// Disk buffers use file-based storage. Having two components write to the same
+/// buffer file would corrupt data. This variant ensures each buffer has a unique path.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum Resource {
     Port(SocketAddr, Protocol),
@@ -399,12 +535,37 @@ impl Resource {
         Self::Port(addr, Protocol::Udp)
     }
 
-    /// From given components returns all that have a resource conflict with any other component.
+    /// Detects resource conflicts between components.
     ///
-    /// This handles a subtle case with "unspecified" IP addresses (0.0.0.0 or ::).
-    /// Binding to an unspecified address means "bind to all interfaces", so
-    /// 0.0.0.0:8080 conflicts with 192.168.1.1:8080 because the former would
-    /// already be listening on the latter's interface.
+    /// Returns a map of `Resource → Set<ComponentKey>` for all resources
+    /// claimed by multiple components. An empty map means no conflicts.
+    ///
+    /// **The unspecified address problem:**
+    ///
+    /// This handles a subtle networking edge case. When you bind to 0.0.0.0 (IPv4)
+    /// or :: (IPv6), you're saying "bind to ALL network interfaces". This means:
+    ///
+    /// - Binding to 0.0.0.0:8080 captures traffic on ALL interfaces port 8080
+    /// - Binding to 192.168.1.1:8080 tries to capture traffic on ONE interface port 8080
+    /// - These CONFLICT because the first already grabbed port 8080 everywhere
+    ///
+    /// **Algorithm:**
+    ///
+    /// 1. Build a map: Resource → Set of components claiming it
+    /// 2. Track any binds to unspecified addresses (0.0.0.0 or ::)
+    /// 3. For each unspecified bind, check if it conflicts with any specific binds on same port
+    /// 4. Filter to only resources with >1 component (conflicts)
+    /// 5. Return the conflict map
+    ///
+    /// **Example:**
+    /// ```ignore
+    /// let components = vec![
+    ///     ("http_source", vec![Resource::tcp("0.0.0.0:8080")]),
+    ///     ("https_source", vec![Resource::tcp("192.168.1.1:8080")]),  // CONFLICT!
+    /// ];
+    /// let conflicts = Resource::conflicts(components);
+    /// // conflicts contains Resource::tcp("0.0.0.0:8080") with both components
+    /// ```
     pub fn conflicts<K: Eq + Hash + Clone>(
         components: impl IntoIterator<Item = (K, Vec<Resource>)>,
     ) -> HashMap<Resource, HashSet<K>> {

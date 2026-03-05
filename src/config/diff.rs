@@ -1,3 +1,206 @@
+//! Configuration diff computation for hot reload.
+//!
+//! When Vector's config files change, we need to apply updates without
+//! restarting everything. This module computes the minimal set of changes
+//! needed to transform one config into another.
+//!
+//! # The Problem: Zero-Downtime Updates
+//!
+//! Consider a running Vector with 50 components:
+//! - 10 sources reading from various files/streams
+//! - 20 transforms processing data
+//! - 20 sinks sending to different destinations
+//!
+//! If you change ONE transform's config, we don't want to:
+//! 1. Stop all 50 components
+//! 2. Restart all 50 components
+//! 3. Lose in-flight events in all buffers
+//!
+//! Instead, we want:
+//! 1. Identify which components changed
+//! 2. Stop only the affected components
+//! 3. Restart only those components
+//! 4. Keep everything else running
+//!
+//! # ConfigDiff Structure
+//!
+//! ```ignore
+//! pub struct ConfigDiff {
+//!     pub sources: Difference,        // Changes to sources
+//!     pub transforms: Difference,     // Changes to transforms
+//!     pub sinks: Difference,          // Changes to sinks
+//!     pub enrichment_tables: Difference, // Changes to enrichment tables
+//!     pub components_to_reload: HashSet<ComponentKey>,  // Forced reloads
+//! }
+//!
+//! pub struct Difference {
+//!     pub to_remove: HashSet<ComponentKey>,  // Components to shut down
+//!     pub to_change: HashSet<ComponentKey>,  // Components to restart
+//!     pub to_add: HashSet<ComponentKey>,     // Components to start fresh
+//! }
+//! ```
+//!
+//! # How Diff is Computed
+//!
+//! The algorithm is surprisingly simple:
+//!
+//! 1. **Serialize both configs to JSON**
+//!    ```ignore
+//!    let old_value = serde_json::to_value(&old["my_source"])?;
+//!    let new_value = serde_json::to_value(&new["my_source"])?;
+//!    ```
+//!
+//! 2. **Compare the serialized values**
+//!    ```ignore
+//!    if old_value != new_value {
+//!        // Component changed!
+//!    }
+//!    ```
+//!
+//! **Why JSON, not equality comparison?**
+//!
+//! Rust's `#[derive(PartialEq)]` would work, but:
+//! - Two configs might be semantically identical but structurally different
+//!   (e.g., different field order in YAML)
+//! - JSON provides canonical representation (sorted keys, consistent formatting)
+//! - Handles HashMaps correctly (order shouldn't matter)
+//!
+//! **Why not compare YAML strings?**
+//!
+//! YAML has too much flexibility:
+//! - `{"a": 1, "b": 2}` vs `{"b": 2, "a": 1}` - different strings, same value
+//! - `enabled: true` vs `enabled: True` - different YAML, same meaning
+//!
+//! JSON normalization ensures we only detect ACTUAL changes.
+//!
+//! # The Three Categories
+//!
+//! **to_remove**: Components that existed in old config but not in new
+//! ```yaml
+//! # Old config
+//! sources:
+//!   old_source:
+//!     type: file
+//!     path: /var/log/old.log
+//!
+//! # New config - "old_source" removed
+//! sources:
+//!   new_source:
+//!     type: file
+//!     path: /var/log/new.log
+//! ```
+//!
+//! **to_add**: Components that exist in new config but not in old
+//! ```yaml
+//! # Old config - no "new_source"
+//! # New config - "new_source" added
+//! sources:
+//!   new_source:
+//!     type: file
+//!     path: /var/log/new.log
+//! ```
+//!
+//! **to_change**: Components that exist in both but with different configs
+//! ```yaml
+//! # Old config
+//! transforms:
+//!   parser:
+//!     type: remap
+//!     source: '.message = .raw'
+//!
+//! # New config - "parser" still exists but config changed
+//! transforms:
+//!   parser:
+//!     type: remap
+//!     source: '.message = string(.raw)'  # Changed!
+//! ```
+//!
+//! # Cascading Changes
+//!
+//! When a component changes, downstream components may need to reload:
+//!
+//! ```text
+//! Source A (changed) → Transform B → Sink C
+//! ```
+//!
+//! If Source A's OUTPUT TYPE changed (e.g., from logs to metrics), Transform B
+//! might be incompatible. The topology builder handles this by:
+//! 1. Checking which changed components have different outputs
+//! 2. Propagating the change downstream
+//! 3. Adding affected components to `components_to_reload`
+//!
+//! This is tracked separately from `to_change` because the component's OWN
+//! config didn't change, but it needs to restart anyway.
+//!
+//! # Enrichment Tables: A Special Case
+//!
+//! Enrichment tables can generate both a source AND a sink component:
+//!
+//! ```yaml
+//! enrichment_tables:
+//!   my_memory_table:
+//!     type: memory
+//!     inputs: ["some_source"]  # Creates a sink to write to the table
+//!     source_config:           # Creates a source to read from the table
+//!       source_key: "my_memory_table_source"
+//! ```
+//!
+//! The diff logic handles this by:
+//! 1. Extracting both derived components (source + sink)
+//! 2. Adding both to the diff if the table config changed
+//!
+//! This is why `from_enrichment_tables()` is a separate method - it has to
+//! decompose the enrichment table into its constituent parts.
+//!
+//! # The `flip()` Method
+//!
+//! During reload, we sometimes need to "undo" a diff:
+//!
+//! ```ignore
+//! let diff = ConfigDiff::new(&old, &new);
+//! // ... apply changes to go from old → new ...
+//!
+//! let reverse_diff = diff.flip();  // new → old
+//! // ... use to undo changes if something fails ...
+//! ```
+//!
+//! This swaps `to_remove` ↔ `to_add`, giving us the reverse transformation.
+//!
+//! # Hot Reload Flow
+//!
+//! ```text
+//! 1. Config file changes
+//!    ↓
+//! 2. Watcher detects change (watcher.rs)
+//!    ↓
+//! 3. New config loaded and validated (loading/mod.rs)
+//!    ↓
+//! 4. ConfigDiff::new(old, new) computed (this module)
+//!    ↓
+//! 5. Topology builder applies diff:
+//!    a. Stop components in to_remove
+//!    b. Stop components in to_change
+//!    c. Start new components in to_add
+//!    d. Restart components in to_change with new config
+//!    ↓
+//! 6. Running topology updated, zero downtime
+//! ```
+//!
+//! # IndexMap: Why Order Matters
+//!
+//! Config uses `IndexMap` (not `HashMap`) for component storage. This is
+//! critical for diff stability:
+//!
+//! ```ignore
+//! // HashMap iteration order is undefined
+//! // Two identical configs might serialize differently!
+//!
+//! // IndexMap preserves insertion order
+//! // Same config always serializes the same way
+//! ```
+//!
+//! Without stable ordering, we'd get false positives: configs that are
+//! semantically identical but serialize differently would appear as "changed".
 use std::collections::HashSet;
 
 use indexmap::IndexMap;

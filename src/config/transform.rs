@@ -1,3 +1,153 @@
+//! Transform configuration traits and types.
+//!
+//! Transforms are the processing nodes in Vector's data pipeline. They:
+//! - Receive events from sources or other transforms
+//! - Modify, filter, route, or enrich events
+//! - Emit events to downstream transforms or sinks
+//!
+//! # Transform vs Source: The Key Difference
+//!
+//! Unlike sources, transforms have INPUTS. This is reflected in `TransformOuter`:
+//!
+//! ```ignore
+//! pub struct TransformOuter<T> {
+//!     pub inputs: Inputs<T>,        // Which components feed into this transform
+//!     pub inner: BoxedTransform,    // The actual transform configuration
+//! }
+//! ```
+//!
+//! The `inputs` field is why we have two type parameters in the config system:
+//! - `TransformOuter<String>` during building (inputs are raw strings from YAML)
+//! - `TransformOuter<OutputId>` after compilation (inputs are resolved references)
+//!
+//! # The TransformConfig Trait
+//!
+//! Every transform implements `TransformConfig`:
+//!
+//! ```ignore
+//! #[async_trait]
+//! #[typetag::serde(tag = "type")]
+//! pub trait TransformConfig: DynClone + NamedComponent + Debug + Send + Sync {
+//!     async fn build(&self, cx: &TransformContext) -> Result<Transform>;
+//!     fn input(&self) -> Input;                                      // What types we accept
+//!     fn outputs(&self, cx: &TransformContext, ...) -> Vec<TransformOutput>; // What types we produce
+//!     fn validate(&self, merged_definition: &schema::Definition) -> Result<(), Vec<String>>;
+//! }
+//! ```
+//!
+//! **Input/Output Type Declaration:**
+//!
+//! The `input()` and `outputs()` methods declare type constraints:
+//!
+//! ```ignore
+//! impl TransformConfig for RemapConfig {
+//!     fn input(&self) -> Input {
+//!         Input::log()  // Only accepts log events
+//!     }
+//!     
+//!     fn outputs(&self, ...) -> Vec<TransformOutput> {
+//!         vec![TransformOutput::new(DataType::Log, ...)]  // Produces log events
+//!     }
+//! }
+//! ```
+//!
+//! This is used by `graph.rs` to validate type compatibility:
+//! - A `Log → Log` transform can't be fed by a `Metric` source
+//! - An `Any → Any` transform can handle any input type
+//!
+//! # Schema-Aware Transforms
+//!
+//! Some transforms (like `remap`) need to know the schema of incoming events:
+//!
+//! ```ignore
+//! pub struct TransformContext {
+//!     pub merged_schema_definition: schema::Definition,  // Merged schema from all inputs
+//!     pub schema_definitions: HashMap<Option<String>, HashMap<OutputId, schema::Definition>>,
+//! }
+//! ```
+//!
+//! The `merged_schema_definition` combines schemas from all inputs. This allows:
+//! - VRL programs to use autocomplete with known field names
+//! - Type coercion to be more lenient (field already known as string? no need to coerce)
+//! - Better error messages (expected `string`, got `integer`)
+//!
+//! # Multiple Outputs (Branching Transforms)
+//!
+//! Some transforms have multiple outputs (like the `route` transform):
+//!
+//! ```yaml
+//! transforms:
+//!   router:
+//!     type: route
+//!     inputs: ["my_source"]
+//!     route:
+//!       errors: '.level == "error"'
+//!       info: '.level == "info"'
+//!
+//! sinks:
+//!   error_sink:
+//!     type: http
+//!     inputs: ["router.errors"]  # Note the dotted syntax
+//! ```
+//!
+//! The `outputs()` method returns multiple `TransformOutput` entries, each with a `port`:
+//!
+//! ```ignore
+//! vec![
+//!     TransformOutput::new(DataType::Log, ...).with_port("errors"),
+//!     TransformOutput::new(DataType::Log, ...).with_port("info"),
+//! ]
+//! ```
+//!
+//! The `OutputId` struct captures this:
+//! ```ignore
+//! pub struct OutputId {
+//!     pub component: ComponentKey,  // "router"
+//!     pub port: Option<String>,     // Some("errors")
+//! }
+//! ```
+//!
+//! # Transform Expansion (Nested Topologies)
+//!
+//! Some transforms expand into sub-topologies (e.g., `reduce` creates internal transforms).
+//! The `nestable()` method controls this:
+//!
+//! ```ignore
+//! fn nestable(&self, parents: &HashSet<&'static str>) -> bool {
+//!     // Prevent infinite recursion
+//!     !parents.contains("reduce")
+//! }
+//! ```
+//!
+//! This prevents infinite expansion chains and detects known incompatibilities.
+//!
+//! # Concurrency Control
+//!
+//! Transforms can opt into parallel execution:
+//!
+//! ```ignore
+//! fn enable_concurrency(&self) -> bool {
+//!     true  // This transform can be run in parallel
+//! }
+//! ```
+//!
+//! When enabled, the topology spawns multiple instances of the transform and
+//! fans out events across them. This is useful for CPU-intensive transforms
+//! (like `remap` with complex VRL programs) but adds overhead for lightweight
+//! transforms (like `filter`).
+//!
+//! # Hot Reload Considerations
+//!
+//! During hot reload, transforms can have external files they watch:
+//!
+//! ```ignore
+//! fn files_to_watch(&self) -> Vec<&PathBuf> {
+//!     &self.vrl_program_file  // Watch this file for changes
+//! }
+//! ```
+//!
+//! When these files change, the transform is rebuilt even if its config
+//! appears unchanged. This is tracked by `transform_keys_with_external_files()`.
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},

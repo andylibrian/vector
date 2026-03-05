@@ -8,6 +8,69 @@
 //!
 //! The builder is compiled into a `Config` via the `compiler` module, which
 //! performs validation and resolution of component references.
+//!
+//! # Why ConfigBuilder Exists
+//!
+//! The builder pattern is essential for Vector's multi-file configuration support.
+//! Consider a production deployment with:
+//!
+//! ```text
+//! /etc/vector/
+//!   ├── base.yaml          # Global settings, common sources
+//!   ├── transforms.yaml    # Data processing pipeline
+//!   └── sinks-prod.yaml    # Production destinations
+//! ```
+//!
+//! Each file is parsed into a `ConfigBuilder`. We can't validate individual files
+//! because:
+//! 1. `sinks-prod.yaml` references transforms defined in `transforms.yaml`
+//! 2. We don't know if all references exist until ALL files are loaded
+//! 3. Validation needs the complete graph to detect cycles and type mismatches
+//!
+//! The solution:
+//! ```text
+//! base.yaml → ConfigBuilder ─┐
+//! transforms.yaml → ConfigBuilder ─┼→ Merged Builder → Validation → Config
+//! sinks-prod.yaml → ConfigBuilder ─┘
+//! ```
+//!
+//! # Input Resolution: String vs OutputId
+//!
+//! Notice that `ConfigBuilder` stores inputs as `String`:
+//! ```ignore
+//! pub struct ConfigBuilder {
+//!     pub sinks: IndexMap<ComponentKey, SinkOuter<String>>,
+//!     //                              ^^^^^^
+//! }
+//! ```
+//!
+//! But `Config` stores inputs as `OutputId`:
+//! ```ignore
+//! pub struct Config {
+//!     sinks: IndexMap<ComponentKey, SinkOuter<OutputId>>,
+//!     //                             ^^^^^^^^
+//! }
+//! ```
+//!
+//! This is because:
+//! - **ConfigBuilder**: Inputs are raw strings from YAML (e.g., `"my_source"`)
+//! - **Config**: Inputs are resolved references with optional port names
+//!
+//! The compiler resolves strings → OutputIds by:
+//! 1. Building a map of all valid component outputs
+//! 2. Looking up each input string in the map
+//! 3. Failing if any input doesn't match a known output
+//!
+//! # Merging Multiple Configs
+//!
+//! The `append()` method merges builders, with these rules:
+//! - **Duplicate component names**: Error (can't have two sources named "my_source")
+//! - **Duplicate test names**: Error
+//! - **Global options**: Merged with conflict detection (some values can be inherited/overridden,
+//!   but conflicting explicit values are rejected)
+//!
+//! This ensures atomic config loading - if ANY conflict exists, the entire
+//! merge fails and Vector refuses to start with a partial/broken config.
 
 use std::{path::Path, time::Duration};
 

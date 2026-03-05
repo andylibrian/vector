@@ -1,3 +1,234 @@
+//! Graph validation for Vector topologies.
+//!
+//! This module validates that a Vector configuration forms a valid directed
+//! acyclic graph (DAG) with:
+//! - No cycles (data can't flow in circles)
+//! - Valid connections (inputs match existing outputs)
+//! - Type compatibility (log sources don't feed metric-only sinks)
+//!
+//! # The Graph Model
+//!
+//! Vector's topology is modeled as a graph:
+//! - **Nodes**: Components (sources, transforms, sinks)
+//! - **Edges**: Data flow (source → transform → sink)
+//!
+//! ```text
+//! Source "web_logs"
+//!   └─ Output: Log
+//!        │
+//!        ↓
+//! Transform "parser"
+//!   ├─ Input: Log
+//!   └─ Output: Log
+//!        │
+//!        ↓
+//! Sink "elastic"
+//!   └─ Input: Log
+//! ```
+//!
+//! # Node Types
+//!
+//! ```ignore
+//! pub enum Node {
+//!     Source {
+//!         outputs: Vec<SourceOutput>,  // What this source emits
+//!     },
+//!     Transform {
+//!         in_ty: DataType,              // What this transform accepts
+//!         outputs: Vec<TransformOutput>, // What this transform emits
+//!     },
+//!     Sink {
+//!         ty: DataType,  // What this sink accepts
+//!     },
+//! }
+//! ```
+//!
+//! **Why do sources and transforms have outputs, but sinks don't?**
+//!
+//! - Sources: Emit data into the topology (1+ output streams)
+//! - Transforms: Receive data, process it, emit transformed data (1+ outputs)
+//! - Sinks: Receive data and send it OUT of Vector (no outputs)
+//!
+//! Sinks are terminal nodes in the graph.
+//!
+//! # Edge Resolution
+//!
+//! Config files specify inputs as strings:
+//!
+//! ```yaml
+//! transforms:
+//!   parser:
+//!     inputs: ["web_logs"]  # String reference
+//! ```
+//!
+//! The graph builder resolves these strings to `OutputId` references:
+//!
+//! ```ignore
+//! pub struct OutputId {
+//!     pub component: ComponentKey,  // Which component
+//!     pub port: Option<String>,     // Which output (for multi-output transforms)
+//! }
+//! ```
+//!
+//! **The input_map() method:**
+//!
+//! Before resolving edges, we build a lookup table:
+//! ```text
+//! "web_logs" → OutputId { component: "web_logs", port: None }
+//! "parser.errors" → OutputId { component: "parser", port: Some("errors") }
+//! "parser" → OutputId { component: "parser", port: None }
+//! ```
+//!
+//! This handles ambiguity detection (two components with the same string
+//! representation) and enables fast lookups during edge creation.
+//!
+//! # Cycle Detection
+//!
+//! Cycles are fatal because they would cause infinite loops:
+//!
+//! ```yaml
+//! transforms:
+//!   a:
+//!     inputs: ["b"]
+//!   b:
+//!     inputs: ["c"]
+//!   c:
+//!     inputs: ["a"]  # CYCLE: a → b → c → a
+//! ```
+//!
+//! **Algorithm: DFS with stack tracking**
+//!
+//! ```ignore
+//! fn check_for_cycles(&self) -> Result<(), String> {
+//!     for sink in all_sinks {
+//!         // DFS from sink backwards (following inputs)
+//!         let mut stack = IndexSet::new();
+//!         // ... if we encounter a node already in stack, it's a cycle
+//!     }
+//! }
+//! ```
+//!
+//! **Why start from sinks?**
+//!
+//! Sinks are the only guaranteed endpoints. Sources have no inputs, so
+//! traversing forward would miss disconnected components. By starting
+//! from sinks and going backwards:
+//! - We only traverse reachable components
+//! - We naturally ignore dead code (unreferenced sources/transforms)
+//! - We detect cycles in the actual data flow
+//!
+//! # Type Checking
+//!
+//! Components declare their data type constraints:
+//!
+//! ```ignore
+//! enum DataType {
+//!     Log,      // Log events
+//!     Metric,   // Metric events
+//!     Trace,    // Trace events
+//!     // ... with bitwise composition for "any" or "log | metric"
+//! }
+//! ```
+//!
+//! **Type intersection:**
+//!
+//! ```ignore
+//! fn intersects(&self, other: &DataType) -> bool {
+//!     // Log intersects with Log
+//!     // Log intersects with Any
+//!     // Log does NOT intersect with Metric
+//! }
+//! ```
+//!
+//! The validator checks each edge:
+//! ```ignore
+//! for edge in &self.edges {
+//!     let from_ty = get_output_type(&edge.from);
+//!     let to_ty = get_input_type(&edge.to);
+//!     if !from_ty.intersects(to_ty) {
+//!         error!("Type mismatch!");
+//!     }
+//! }
+//! ```
+//!
+//! **Special case: DataType::all_bits()**
+//!
+//! Some components accept ANY type:
+//! ```ignore
+//! impl SinkConfig for ConsoleSinkConfig {
+//!     fn input(&self) -> Input {
+//!         Input::any()  // Accepts logs, metrics, traces
+//!     }
+//! }
+//! ```
+//!
+//! This is represented as `DataType::all_bits()` and intersects with everything.
+//!
+//! # Wildcard Input Matching
+//!
+//! Vector supports wildcard patterns in inputs:
+//!
+//! ```yaml
+//! sinks:
+//!   all_logs:
+//!     inputs: ["logs-*"]  # Matches logs-nginx, logs-app, logs-system
+//! ```
+//!
+//! **Strict vs Relaxed matching:**
+//!
+//! ```ignore
+//! enum WildcardMatching {
+//!     Strict,   // Wildcard must match at least one component
+//!     Relaxed,  // Wildcard can match zero components (useful for dynamic sources)
+//! }
+//! ```
+//!
+//! With relaxed matching, if you deploy a config before the sources exist,
+//! Vector won't fail - it will just receive zero events until sources appear.
+//!
+//! # Ambiguity Detection
+//!
+//! Input specifiers must be unambiguous:
+//!
+//! ```yaml
+//! transforms:
+//!   foo.bar:    # Component named "foo.bar"
+//!     inputs: []
+//!   foo:
+//!     outputs:  # Transform with named output "bar"
+//!       bar: ...
+//!
+//! sinks:
+//!   sink1:
+//!     inputs: ["foo.bar"]  # AMBIGUOUS! Which one?
+//! ```
+//!
+//! The `input_map()` method detects this during construction:
+//! ```ignore
+//! if mapped.insert(id.to_string(), id.clone()).is_some() {
+//!     errors.insert(format!("Input specifier {id} is ambiguous"));
+//! }
+//! ```
+//!
+//! # Path Tracing
+//!
+//! The `paths_to_sink_from()` method finds all paths from a root to sinks:
+//!
+//! ```text
+//! Source "in"
+//!   ├─→ Transform "a" → Sink "out1"
+//!   └─→ Transform "b" → Sink "out2"
+//! ```
+//!
+//! This is used for unit tests to determine which transforms are relevant
+//! when testing a specific source. If a test only cares about "in → a → out1",
+//! we don't need to run the "b" transform.
+//!
+//! **Algorithm:**
+//! 1. DFS from root
+//! 2. Track path to current node
+//! 3. When reaching a sink, record the path
+//! 4. Return all recorded paths
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,

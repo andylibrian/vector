@@ -1,3 +1,119 @@
+//! Source configuration traits and types.
+//!
+//! Sources are the entry points for data into Vector. They:
+//! - Read data from external systems (files, network, APIs)
+//! - Convert raw data into Vector events (logs, metrics, traces)
+//! - Push events into the topology for processing
+//!
+//! # The SourceConfig Trait
+//!
+//! Every source implements `SourceConfig`, which defines:
+//! - How to parse its configuration from YAML/JSON
+//! - How to build a running source instance
+//! - What outputs it produces (for type checking)
+//! - What system resources it needs (for conflict detection)
+//!
+//! # Component Registration
+//!
+//! Sources register themselves using two attributes:
+//!
+//! ```ignore
+//! #[derive(Debug, Clone)]
+//! #[serde(deny_unknown_fields)]
+//! struct FileConfig {
+//!     include: Vec<PathBuf>,
+//! }
+//!
+//! #[async_trait]
+//! #[typetag::serde(name = "file")]  // Registers "file" → FileConfig
+//! impl SourceConfig for FileConfig {
+//!     async fn build(&self, cx: SourceContext) -> Result<Source> { ... }
+//!     fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> { ... }
+//! }
+//! ```
+//!
+//! The `#[typetag::serde]` attribute:
+//! - Creates a global registry entry: `"file"` → deserializer for `FileConfig`
+//! - Enables polymorphic deserialization: `{ "type": "file", ... }` → `FileConfig`
+//! - Eliminates the need for a giant match statement in the config parser
+//!
+//! # Dynamic Dispatch via BoxedSource
+//!
+//! Notice that `SourceOuter` stores `BoxedSource` (a type alias for `Box<dyn SourceConfig>`):
+//!
+//! ```ignore
+//! pub struct SourceOuter {
+//!     pub inner: BoxedSource,  // Box<dyn SourceConfig>
+//! }
+//! ```
+//!
+//! **Why Box<dyn Trait>?**
+//!
+//! Different sources have different config types:
+//! - `FileConfig` for file sources
+//! - `HttpServerConfig` for HTTP sources
+//! - `KafkaConfig` for Kafka sources
+//!
+//! We need to store ALL of these in the same `IndexMap`. Rust's type system
+//! requires collections to be homogeneous (same type), so we use trait objects:
+//! - `dyn SourceConfig` - any type implementing the trait
+//! - `Box<dyn SourceConfig>` - heap-allocated, dynamically dispatched
+//!
+//! This is a common pattern in plugin architectures where the set of types
+//! isn't known at compile time.
+//!
+//! # Source Outputs and Type Checking
+//!
+//! The `outputs()` method declares what data types a source produces:
+//!
+//! ```ignore
+//! impl SourceConfig for FileConfig {
+//!     fn outputs(&self, _: LogNamespace) -> Vec<SourceOutput> {
+//!         vec![SourceOutput::new_logs(DataType::Log, schema)]
+//!     }
+//! }
+//! ```
+//!
+//! This is used during validation to ensure:
+//! - A log-only source doesn't feed into a metrics-only sink
+//! - Type conversions are possible where needed
+//!
+//! Multiple outputs are possible (e.g., a source that produces both logs and metrics).
+//!
+//! # Resource Declaration
+//!
+//! Sources declare exclusive system resources they need:
+//!
+//! ```ignore
+//! impl SourceConfig for HttpServerConfig {
+//!     fn resources(&self) -> Vec<Resource> {
+//!         vec![Resource::tcp(self.address)]
+//!     }
+//! }
+//! ```
+//!
+//! The config validator checks for conflicts BEFORE starting components:
+//! - Two HTTP servers can't both bind to port 8080
+//! - Two components can't claim the same exclusive resource
+//!
+//! This prevents runtime errors and provides clear error messages.
+//!
+//! # The SourceContext
+//!
+//! When building a source, Vector provides a context with runtime dependencies:
+//!
+//! ```ignore
+//! pub struct SourceContext {
+//!     pub key: ComponentKey,           // Source name for logging/metrics
+//!     pub globals: GlobalOptions,      // Global config (data_dir, etc.)
+//!     pub out: SourceSender,           // Channel to send events to topology
+//!     pub shutdown: ShutdownSignal,    // Signal to stop gracefully
+//!     pub acknowledgements: bool,      // Whether end-to-end acks are enabled
+//! }
+//! ```
+//!
+//! The `out: SourceSender` is the source's output channel. Sources push events
+//! into this channel, and the topology routes them to connected transforms/sinks.
 use std::{cell::RefCell, collections::HashMap, time::Duration};
 
 use async_trait::async_trait;
