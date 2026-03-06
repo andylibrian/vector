@@ -52,8 +52,8 @@
 //! ```
 //!
 //! This is used by `graph.rs` to validate type compatibility:
-//! - A `Log → Log` transform can't be fed by a `Metric` source
-//! - An `Any → Any` transform can handle any input type
+//! - A `Log -> Log` transform can't be fed by a `Metric` source
+//! - An `Any -> Any` transform can handle any input type
 //!
 //! # Schema-Aware Transforms
 //!
@@ -148,6 +148,27 @@
 //!
 //! When these files change, the transform is rebuilt even if its config
 //! appears unchanged. This is tracked by `transform_keys_with_external_files()`.
+//!
+//! # The Build Lifecycle
+//!
+//! Understanding when each method is called is crucial for implementers:
+//!
+//! 1. **Parsing**: Config is deserialized from YAML/JSON into your config struct
+//! 2. **Validation**: `validate()` is called with the merged input schema
+//! 3. **Output Discovery**: `outputs()` is called to build the topology graph
+//! 4. **Building**: `build()` is called to create the runtime transform
+//!
+//! The `build()` method receives a `TransformContext` containing:
+//! - Schema information from upstream components
+//! - Enrichment tables for VRL lookups
+//! - Global configuration options
+//!
+//! # Thread Safety Requirements
+//!
+//! Config structs must be `Send + Sync + Clone` because:
+//! - They're shared across async tasks during validation
+//! - They're cloned during hot reload to compare old vs new configs
+//! - They may be accessed concurrently during topology building
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -267,22 +288,105 @@ where
     }
 }
 
+/// Context provided to transforms during the build phase.
+///
+/// This struct bundles together everything a transform might need to construct its
+/// runtime representation. It's created by the topology builder and passed to
+/// `TransformConfig::build()`.
+///
+/// # Why This Struct Exists
+///
+/// Without this struct, `build()` would need a dozen parameters:
+/// ```ignore
+/// fn build(
+///     &self,
+///     key: ComponentKey,
+///     globals: GlobalOptions,
+///     enrichment_tables: TableRegistry,
+///     schema_definitions: HashMap<...>,
+///     merged_schema: Definition,
+///     // ... more params
+/// ) -> Result<Transform>;
+/// ```
+///
+/// This bundling makes the API stable (new fields can be added without breaking
+/// existing implementations) and makes testing easier (you can create a minimal
+/// context with `TransformContext::default()`).
+///
+/// # Schema Propagation
+///
+/// The schema fields enable type-aware transforms:
+/// - `merged_schema_definition`: Combined schema from all upstream inputs
+/// - `schema_definitions`: Per-output schemas (for multi-output upstreams)
+///
+/// The `remap` transform uses these to:
+/// 1. Provide better autocomplete in VRL
+/// 2. Skip unnecessary type coercions
+/// 3. Generate better error messages
+///
+/// # Example: Using TransformContext
+///
+/// ```ignore
+/// async fn build(&self, context: &TransformContext) -> Result<Transform> {
+///     // Access global timezone setting
+///     let timezone = context.globals.timezone();
+///     
+///     // Pass schema to VRL compiler for type checking
+///     let program = compile_vrl(
+///         &self.source,
+///         context.merged_schema_definition.clone(),
+///     )?;
+///     
+///     // Use enrichment tables for GeoIP lookups in VRL
+///     let tables = context.enrichment_tables.clone();
+///     
+///     Ok(Transform::function(MyTransform { program, timezone, tables }))
+/// }
+/// ```
 pub struct TransformContext {
-    // This is optional because currently there are a lot of places we use `TransformContext` that
-    // may not have the relevant data available (e.g. tests). In the future it'd be nice to make it
-    // required somehow.
+    /// The unique identifier for this transform instance.
+    ///
+    /// Used for logging, metrics, and error messages. Optional because some
+    /// test contexts don't have a component key.
+    ///
+    /// This is optional because currently there are a lot of places we use `TransformContext` that
+    /// may not have the relevant data available (e.g. tests). In the future it'd be nice to make it
+    /// required somehow.
     pub key: Option<ComponentKey>,
 
+    /// Global configuration options shared across all components.
+    ///
+    /// Contains settings like:
+    /// - `timezone`: Default timezone for timestamp parsing
+    /// - `log_schema`: Field name mappings (e.g., "message" vs "message")
+    /// - `data_dir`: Directory for persistent state
     pub globals: GlobalOptions,
 
+    /// Registry of enrichment tables available for lookups.
+    ///
+    /// Enrichment tables are external data sources that VRL can query:
+    /// - GeoIP tables for IP geolocation
+    /// - CSV files for custom lookups
+    /// - Database tables for dynamic enrichment
+    ///
+    /// Transforms that use VRL should pass this to the compiler.
     pub enrichment_tables: vector_lib::enrichment::TableRegistry,
 
+    /// Storage for VRL program metrics.
+    ///
+    /// Tracks VRL-specific metrics like function call counts and durations.
+    /// Shared across all VRL programs in this transform.
     pub metrics_storage: MetricsStorage,
 
     /// Tracks the schema IDs assigned to schemas exposed by the transform.
     ///
     /// Given a transform can expose multiple [`TransformOutput`] channels, the ID is tied to the identifier of
     /// that `TransformOutput`.
+    ///
+    /// This maps: output_port -> (upstream_output_id -> schema_definition)
+    ///
+    /// For single-output transforms, the outer key is `None`. For multi-output
+    /// transforms like `route`, each named output has its own entry.
     pub schema_definitions: HashMap<Option<String>, HashMap<OutputId, schema::Definition>>,
 
     /// The schema definition created by merging all inputs of the transform.
@@ -290,12 +394,23 @@ pub struct TransformContext {
     /// This information can be used by transforms that behave differently based on schema
     /// information, such as the `remap` transform, which passes this information along to the VRL
     /// compiler such that type coercion becomes less of a need for operators writing VRL programs.
+    ///
+    /// When a transform has multiple inputs, their schemas are merged. If input A
+    /// has `{"message": string}` and input B has `{"message": string, "host": string}`,
+    /// the merged schema is `{"message": string}` (intersection).
     pub merged_schema_definition: schema::Definition,
 
+    /// Schema-related options specific to this transform.
+    ///
+    /// Contains settings like:
+    /// - `log_namespace`: Whether to use new Vector namespace
     pub schema: SchemaOptions,
 
     /// Extra context data provided by the running app and shared across all components. This can be
     /// used to pass shared settings or other data from outside the components.
+    ///
+    /// This is an escape hatch for custom builds that need to pass arbitrary
+    /// data to components. Most transforms won't need this.
     pub extra_context: ExtraContext,
 }
 
@@ -349,26 +464,127 @@ impl TransformContext {
 }
 
 /// Generalized interface for describing and building transform components.
+///
+/// This is the core trait that every transform must implement. It defines the contract
+/// between configuration and runtime. The trait uses `#[typetag::serde]` to enable
+/// deserialization from configuration files where the `type` field determines
+/// which concrete type to instantiate.
+///
+/// # The Type Tag System
+///
+/// The `#[typetag::serde(tag = "type")]` attribute enables polymorphic deserialization:
+///
+/// ```yaml
+/// transforms:
+///   my_filter:
+///     type: filter        # <- This selects FilterConfig
+///     condition: "..."
+///   
+///   my_remap:
+///     type: remap         # <- This selects RemapConfig
+///     source: "..."
+/// ```
+///
+/// Each implementation must also have `#[typetag::serde(name = "filter")]`
+/// to specify its type name.
+///
+/// # Required Trait Bounds
+///
+/// - `DynClone`: Allows cloning trait objects (needed for config diffing during reload)
+/// - `NamedComponent`: Provides the component type name (e.g., "filter", "remap")
+/// - `Debug`: For logging and error messages
+/// - `Send + Sync`: Required for async/parallel processing
+///
+/// # Implementation Example
+///
+/// ```ignore
+/// #[async_trait]
+/// #[typetag::serde(name = "filter")]
+/// impl TransformConfig for FilterConfig {
+///     async fn build(&self, context: &TransformContext) -> Result<Transform> {
+///         // Build the runtime transform
+///         let condition = self.condition.build(&context.enrichment_tables)?;
+///         Ok(Transform::function(Filter::new(condition)))
+///     }
+///
+///     fn input(&self) -> Input {
+///         Input::all()  // Accepts logs, metrics, and traces
+///     }
+///
+///     fn outputs(&self, _: &TransformContext, inputs: &[(OutputId, Definition)])
+///         -> Vec<TransformOutput>
+///     {
+///         // Pass through the same types we receive
+///         vec![TransformOutput::new(DataType::all_bits(), clone_input_definitions(inputs))]
+///     }
+///
+///     fn enable_concurrency(&self) -> bool {
+///         true  // Stateless, safe to parallelize
+///     }
+/// }
+/// ```
 #[async_trait]
 #[typetag::serde(tag = "type")]
 pub trait TransformConfig: DynClone + NamedComponent + core::fmt::Debug + Send + Sync {
     /// Builds the transform with the given context.
     ///
-    /// If the transform is built successfully, `Ok(...)` is returned containing the transform.
+    /// This is where configuration becomes runtime. The transform should:
+    /// 1. Validate any remaining configuration (beyond what `validate()` checked)
+    /// 2. Compile any DSLs (e.g., VRL programs)
+    /// 3. Create the appropriate `Transform` variant
+    ///
+    /// The returned `Transform` variant determines the execution model:
+    /// - `Transform::function()` for `FunctionTransform` (simplest, fastest)
+    /// - `Transform::synchronous()` for `SyncTransform` (multiple outputs)
+    /// - `Transform::task()` for `TaskTransform` (async, stateful)
+    ///
+    /// # Why async?
+    ///
+    /// Some transforms need to perform async I/O during build:
+    /// - Fetching remote schema information
+    /// - Connecting to external services
+    /// - Loading large enrichment tables
     ///
     /// # Errors
     ///
     /// If an error occurs while building the transform, an error variant explaining the issue is
-    /// returned.
+    /// returned. The error will be displayed to the user during config validation.
     async fn build(&self, globals: &TransformContext) -> crate::Result<Transform>;
 
     /// Gets the input configuration for this transform.
+    ///
+    /// This declares what event types the transform accepts. The topology builder
+    /// uses this to validate that upstream components produce compatible types.
+    ///
+    /// Common patterns:
+    /// - `Input::all()` - Accepts logs, metrics, and traces (e.g., `filter`)
+    /// - `Input::log()` - Only accepts log events (e.g., `remap` on logs)
+    /// - `Input::metric()` - Only accepts metric events (e.g., `aggregate`)
     fn input(&self) -> Input;
 
     /// Gets the list of outputs exposed by this transform.
     ///
+    /// Most transforms have a single default output, but some (like `route`)
+    /// have multiple named outputs. Each output declares:
+    /// - The data type it produces (logs, metrics, traces)
+    /// - The schema definition for events on this output
+    /// - An optional port name for multi-output transforms
+    ///
     /// The provided `merged_definition` can be used by transforms to understand the expected shape
-    /// of events flowing through the transform.
+    /// of events flowing through the transform. Schema-aware transforms (like `remap`) use this
+    /// for VRL compilation.
+    ///
+    /// # Multi-Output Example
+    ///
+    /// ```ignore
+    /// fn outputs(&self, ...) -> Vec<TransformOutput> {
+    ///     vec![
+    ///         TransformOutput::new(DataType::Log, schemas).with_port("errors"),
+    ///         TransformOutput::new(DataType::Log, schemas).with_port("info"),
+    ///         TransformOutput::new(DataType::Log, schemas).with_port("_unmatched"),
+    ///     ]
+    /// }
+    /// ```
     fn outputs(
         &self,
         globals: &TransformContext,
@@ -377,13 +593,22 @@ pub trait TransformConfig: DynClone + NamedComponent + core::fmt::Debug + Send +
 
     /// Validates that the configuration of the transform is valid.
     ///
-    /// This would generally be where logical conditions were checked, such as ensuring a transform
-    /// isn't using a named output that matches a reserved output name, and so on.
+    /// This is called after config parsing but before building. Use this for
+    /// logical validation that can't be expressed in the type system:
+    /// - Checking for conflicting options
+    /// - Validating references to other components
+    /// - Ensuring reserved names aren't used
+    ///
+    /// This is separate from `build()` because:
+    /// 1. It's called earlier in the pipeline (before building the full topology)
+    /// 2. It can return multiple errors at once (better UX)
+    /// 3. It doesn't need async (simpler error handling)
     ///
     /// # Errors
     ///
     /// If validation does not succeed, an error variant containing a list of all validation errors
-    /// is returned.
+    /// is returned. All errors are collected before returning to give users
+    /// a complete picture of what needs to be fixed.
     fn validate(&self, _merged_definition: &schema::Definition) -> Result<(), Vec<String>> {
         Ok(())
     }
@@ -391,9 +616,28 @@ pub trait TransformConfig: DynClone + NamedComponent + core::fmt::Debug + Send +
     /// Whether or not concurrency should be enabled for this transform.
     ///
     /// When enabled, this transform may be run in parallel in order to attempt to maximize
-    /// throughput for this node in the topology. Transforms should generally not run concurrently
-    /// unless they are compute-heavy, as there is a cost/overhead associated with fanning out
-    /// events to the parallel transform tasks.
+    /// throughput for this node in the topology. The topology spawns multiple worker tasks
+    /// that pull from a shared input queue and process events concurrently.
+    ///
+    /// # When to Enable
+    ///
+    /// Enable concurrency when:
+    /// - The transform is CPU-bound (e.g., complex VRL programs)
+    /// - Event ordering doesn't matter
+    /// - The transform has no shared mutable state
+    ///
+    /// # When NOT to Enable
+    ///
+    /// Don't enable concurrency when:
+    /// - The transform maintains ordering guarantees (e.g., dedupe)
+    /// - The transform has shared mutable state (most don't)
+    /// - The transform is I/O-bound (use TaskTransform instead)
+    ///
+    /// # Performance Considerations
+    ///
+    /// There is a cost/overhead associated with fanning out events to parallel tasks.
+    /// For very lightweight transforms (like simple filters), the overhead may exceed
+    /// the benefit. Benchmark before enabling.
     fn enable_concurrency(&self) -> bool {
         false
     }
@@ -401,18 +645,38 @@ pub trait TransformConfig: DynClone + NamedComponent + core::fmt::Debug + Send +
     /// Whether or not this transform can be nested, given the types of transforms it would be
     /// nested within.
     ///
-    /// For some transforms, they can expand themselves into a subtopology of nested transforms.
-    /// However, in order to prevent an infinite recursion of nested transforms, we may want to only
-    /// allow one layer of "expansion". Additionally, there may be known issues with a transform
-    /// that is nested under another specific transform interacting poorly, or incorrectly.
+    /// Some transforms expand themselves into sub-topologies (e.g., `reduce` creates internal
+    /// transforms for aggregation). This method controls whether such expansion is allowed
+    /// given the current nesting context.
     ///
-    /// This method allows a transform to report if it can or cannot function correctly if it is
-    /// nested under transforms of a specific type, or if such nesting is fundamentally disallowed.
+    /// # Why This Matters
+    ///
+    /// 1. **Prevent infinite recursion**: A transform that expands to itself would loop forever
+    /// 2. **Detect incompatibilities**: Some transforms don't work well when nested
+    /// 3. **Resource limits**: Deep nesting can consume too much memory
+    ///
+    /// # Example: Preventing Recursion
+    ///
+    /// ```ignore
+    /// fn nestable(&self, parents: &HashSet<&'static str>) -> bool {
+    ///     // Don't allow nesting reduce inside reduce
+    ///     !parents.contains("reduce")
+    /// }
+    /// ```
+    ///
+    /// The `parents` set contains all transform types in the current expansion chain.
     fn nestable(&self, _parents: &HashSet<&'static str>) -> bool {
         true
     }
 
-    /// Gets the files to watch to trigger reload
+    /// Gets the files to watch to trigger reload.
+    ///
+    /// Some transforms reference external files (e.g., VRL programs from files).
+    /// When these files change, the transform should be rebuilt even if its
+    /// config hasn't changed.
+    ///
+    /// This is used by the hot reload system to detect when a rebuild is needed.
+    /// The paths are watched for modification timestamps, not content changes.
     fn files_to_watch(&self) -> Vec<&PathBuf> {
         Vec::new()
     }

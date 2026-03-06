@@ -1,3 +1,104 @@
+//! The `remap` transform - Vector's most powerful and widely-used transform.
+//!
+//! This transform uses VRL (Vector Remap Language) to programmatically transform events.
+//! It's the Swiss Army knife of Vector transforms, capable of:
+//! - Field extraction and parsing (JSON, syslog, grok, etc.)
+//! - Data enrichment (GeoIP, lookups, computed fields)
+//! - Field renaming, removal, and restructuring
+//! - Type coercion and validation
+//! - Conditional logic and routing
+//!
+//! # Why This Is a SyncTransform
+//!
+//! The remap transform uses `SyncTransform` instead of `FunctionTransform` because it supports
+//! multiple outputs via the `reroute_dropped` feature:
+//!
+//! ```yaml
+//! transforms:
+//!   my_remap:
+//!     type: remap
+//!     source: ". = parse_json!(.message)"
+//!     drop_on_error: true
+//!     reroute_dropped: true
+//!
+//! sinks:
+//!   successful:
+//!     type: elasticsearch
+//!     inputs: ["my_remap"]  # Events that succeeded
+//!
+//!   failed:
+//!     type: file
+//!     inputs: ["my_remap.dropped"]  # Events that failed
+//! ```
+//!
+//! When `reroute_dropped` is true, the transform has two outputs:
+//! - **Default output**: Events that processed successfully
+//! - **"dropped" output**: Events that failed (with error metadata attached)
+//!
+//! # VRL Compilation
+//!
+//! VRL programs are compiled at startup, not at runtime. This enables:
+//! - Type checking and validation before processing events
+//! - Optimized bytecode/AST execution
+//! - Better error messages with line numbers
+//!
+//! The compilation uses schema information:
+//! ```ignore
+//! // Input schema: { "message": string, "timestamp": timestamp }
+//! // VRL program: .ts = parse_timestamp!(.timestamp, "%Y-%m-%d")
+//! // Compiler knows .timestamp exists and is a string -> better coercion
+//! ```
+//!
+//! # Error Handling Strategy
+//!
+//! VRL programs can fail in several ways:
+//! - **Errors**: Runtime failures (e.g., `int!("not a number")`)
+//! - **Aborts**: Explicit `abort` statements
+//!
+//! The transform handles these with configuration:
+//! - `drop_on_error`: true = discard failed events, false = pass through unchanged
+//! - `drop_on_abort`: true = discard aborted events, false = pass through unchanged
+//! - `reroute_dropped`: true = send dropped events to "dropped" output
+//!
+//! # Performance Considerations
+//!
+//! The remap transform is optimized for high throughput:
+//! - VRL programs compile to efficient bytecode
+//! - Schema-aware compilation reduces runtime checks
+//! - Event cloning is avoided when possible (VRL modifies in-place)
+//! - Caching: Compiled programs are cached by (enrichment_tables, schema) tuple
+//!
+//! # Example Configurations
+//!
+//! **Basic field extraction:**
+//! ```yaml
+//! type: remap
+//! source: '''
+//!   . = parse_json!(.message)
+//!   .timestamp = now()
+//! '''
+//! ```
+//!
+//! **Conditional enrichment:**
+//! ```yaml
+//! type: remap
+//! source: '''
+//!   if .level == "error" {
+//!     . = merge!(., ., .context)
+//!     .tags.error = true
+//!   }
+//! '''
+//! ```
+//!
+//! **Multi-file programs:**
+//! ```yaml
+//! type: remap
+//! files:
+//!   - ./parsers/json.vrl
+//!   - ./enrichment/geoip.vrl
+//!   - ./output/format.vrl
+//! ```
+
 use std::{
     collections::{BTreeMap, HashMap},
     fs::File,
@@ -44,11 +145,46 @@ use crate::{
     transforms::{SyncTransform, Transform, TransformOutputsBuf},
 };
 
+/// The name of the dropped output port.
 const DROPPED: &str = "dropped";
+
+/// Cache key: (enrichment tables, input schema).
+///
+/// Programs are cached by their input context because the same VRL program
+/// may compile differently depending on what fields are available.
 type CacheKey = (TableRegistry, schema::Definition);
+
+/// Cache value: (compiled program, warnings, semantic meanings).
+///
+/// The cache stores:
+/// - The compiled program (for execution)
+/// - Warnings (to show once during startup)
+/// - Semantic meanings (for schema propagation)
 type CacheValue = (Program, String, MeaningList);
 
 /// Configuration for the `remap` transform.
+///
+/// This struct deserializes from YAML and holds all the configuration needed to build
+/// a remap transform. It's designed to be serializable and clonable for config validation.
+///
+/// # Source vs File vs Files
+///
+/// The VRL program can be provided in three ways:
+/// 1. `source`: Inline string (good for short programs)
+/// 2. `file`: Single file path (good for externalized programs)
+/// 3. `files`: Multiple file paths (good for modularity)
+///
+/// Only one of these should be specified. Multiple sources will error.
+///
+/// # Cache Field
+///
+/// The `cache` field stores compiled VRL programs to avoid recompilation during
+/// hot reload. When Vector reloads its config, it often rebuilds transforms with
+/// the same (enrichment_tables, schema) tuple. The cache prevents recompiling.
+///
+/// Why `Mutex<Vec<...>>` instead of `HashMap`?
+/// `TableRegistry` doesn't implement `Hash` or `Ord`, so we use linear search.
+/// The cache is typically small (1-10 entries), so this is fine.
 #[configurable_component(transform(
     "remap",
     "Modify your observability data as it passes through your topology using Vector Remap Language (VRL)."
@@ -573,7 +709,7 @@ where
         //
         // The `drop_on_{error, abort}` transform config allows operators to remove events from the
         // main output if they're failed or aborted, in which case we can skip the cloning, since
-        // any mutations made by VRL will be ignored regardless. If they hav configured
+        // any mutations made by VRL will be ignored regardless. If they have configured
         // `reroute_dropped`, however, we still need to do the clone to ensure that we can forward
         // the event to the `dropped` output.
         let forward_on_error = !self.drop_on_error || self.reroute_dropped;

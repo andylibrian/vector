@@ -1,3 +1,68 @@
+//! The `route` transform - splits event streams into multiple outputs.
+//!
+//! This transform demonstrates `SyncTransform` with multiple named outputs. It evaluates
+//! conditions and sends events to different downstream paths based on which conditions match.
+//!
+//! # Why This Is a SyncTransform
+//!
+//! The route transform uses `SyncTransform` because it needs to write to multiple named outputs:
+//! - Each route has a named output (e.g., "errors", "warnings")
+//! - Plus an optional "_unmatched" output for events that match no route
+//!
+//! `FunctionTransform` can only write to a single output, so we need `SyncTransform`.
+//!
+//! # Configuration Example
+//!
+//! ```yaml
+//! transforms:
+//!   my_router:
+//!     type: route
+//!     inputs: ["my_source"]
+//!     route:
+//!       errors:
+//!         type: vrl
+//!         source: '.level == "error"'
+//!       warnings:
+//!         type: vrl
+//!         source: '.level == "warn"'
+//!
+//! sinks:
+//!   error_sink:
+//!     type: pagerduty
+//!     inputs: ["my_router.errors"]  # Note the dotted syntax
+//!
+//!   warning_sink:
+//!     type: slack
+//!     inputs: ["my_router.warnings"]
+//!
+//!   other_sink:
+//!     type: elasticsearch
+//!     inputs: ["my_router._unmatched"]  # Events that matched no route
+//! ```
+//!
+//! # Multiple Matches
+//!
+//! An event can match MULTIPLE routes. Each matching route gets a copy:
+//!
+//! ```yaml
+//! route:
+//!   has_user:
+//!     type: vrl
+//!     source: 'exists(.user_id)'
+//!   has_timestamp:
+//!     type: vrl
+//!     source: 'exists(.timestamp)'
+//! ```
+//!
+//! An event with both `.user_id` and `.timestamp` would be sent to BOTH outputs.
+//!
+//! # The _unmatched Output
+//!
+//! By default (`reroute_unmatched: true`), events that match NO routes go to the
+//! `_unmatched` output. This prevents accidental data loss.
+//!
+//! Set `reroute_unmatched: false` to silently discard unmatched events.
+
 use indexmap::IndexMap;
 use vector_lib::{
     config::clone_input_definitions, configurable::configurable_component, transform::SyncTransform,
@@ -14,22 +79,51 @@ use crate::{
     transforms::Transform,
 };
 
+/// The reserved name for the unmatched output.
+///
+/// Events that don't match any defined route go here (when `reroute_unmatched` is true).
+/// This name is reserved - users can't create a route named "_unmatched".
 pub(crate) const UNMATCHED_ROUTE: &str = "_unmatched";
 
+/// The runtime route transform.
+///
+/// This struct implements `SyncTransform` and holds:
+/// - Compiled conditions for each route
+/// - Configuration for whether to route unmatched events
+///
+/// # Cloning
+///
+/// When `enable_concurrency()` returns true, the topology clones this struct
+/// for each parallel worker. Each condition must be safely clonable.
 #[derive(Clone)]
 pub struct Route {
+    /// Ordered list of (route_name, condition) pairs.
+    ///
+    /// Using a Vec instead of HashMap preserves the order from the config file.
+    /// This matters when an event could match multiple routes - all matching
+    /// routes receive the event.
     conditions: Vec<(String, Condition)>,
+
+    /// Whether to send unmatched events to the "_unmatched" output.
+    ///
+    /// When false, unmatched events are silently dropped.
     reroute_unmatched: bool,
 }
 
 impl Route {
+    /// Builds the runtime router from configuration.
+    ///
+    /// This compiles each route's condition from config to executable form.
     pub fn new(config: &RouteConfig, context: &TransformContext) -> crate::Result<Self> {
         let mut conditions = Vec::with_capacity(config.route.len());
+
+        // Compile each route's condition
         for (output_name, condition) in config.route.iter() {
             let condition =
                 condition.build(&context.enrichment_tables, &context.metrics_storage)?;
             conditions.push((output_name.clone(), condition));
         }
+
         Ok(Self {
             conditions,
             reroute_unmatched: config.reroute_unmatched,
@@ -37,24 +131,77 @@ impl Route {
     }
 }
 
+/// The `SyncTransform` implementation - where routing decisions happen.
+///
+/// This is the hot path that gets called for every event. The implementation:
+/// 1. Evaluates each route's condition against the event
+/// 2. Pushes to each matching route's output
+/// 3. If no routes matched and reroute_unmatched is true, pushes to "_unmatched"
+///
+/// # Multiple Matches
+///
+/// An event can be pushed to MULTIPLE outputs. This is intentional - it allows
+/// the same event to flow down multiple paths:
+///
+/// ```ignore
+/// // Event: { "level": "error", "has_pii": true }
+///
+/// // Routes:
+/// // - errors: .level == "error"
+/// // - sensitive: .has_pii == true
+///
+/// // Result: Event goes to BOTH "errors" AND "sensitive" outputs
+/// ```
 impl SyncTransform for Route {
     fn transform(&mut self, event: Event, output: &mut vector_lib::transform::TransformOutputsBuf) {
         let mut check_failed: usize = 0;
+
+        // Check each route condition
         for (output_name, condition) in &self.conditions {
+            // Clone the event for each check since conditions may need ownership
             let (result, event) = condition.check(event.clone());
+
             if result {
+                // Route matched: send to this output
                 output.push(Some(output_name), event);
             } else {
                 check_failed += 1;
             }
         }
+
+        // If ALL routes failed and reroute_unmatched is enabled, send to _unmatched
         if self.reroute_unmatched && check_failed == self.conditions.len() {
             output.push(Some(UNMATCHED_ROUTE), event);
         }
+        // Otherwise: event is dropped (no push)
     }
 }
 
 /// Configuration for the `route` transform.
+///
+/// This struct deserializes from YAML and defines:
+/// - Whether to reroute unmatched events
+/// - The map of route names to conditions
+///
+/// # Reserved Names
+///
+/// The following route names are reserved and will cause validation errors:
+/// - `_unmatched`: Reserved for the unmatched output
+/// - `_default`: Reserved for future use
+///
+/// # Example
+///
+/// ```yaml
+/// type: route
+/// reroute_unmatched: true
+/// route:
+///   errors:
+///     type: vrl
+///     source: '.level == "error"'
+///   warnings:
+///     type: vrl
+///     source: '.level in ["warn", "warning"]'
+/// ```
 #[configurable_component(transform(
     "route",
     "Split a stream of events into multiple sub-streams based on user-supplied conditions."
@@ -82,7 +229,7 @@ pub struct RouteConfig {
     /// - `_default`
     ///
     /// Each route can then be referenced as an input by other components with the name
-    /// `<transform_name>.<route_id>`. If an event doesn’t match any route, and if `reroute_unmatched`
+    /// `<transform_name>.<route_id>`. If an event doesn't match any route, and if `reroute_unmatched`
     /// is set to `true` (the default), it is sent to the `<transform_name>._unmatched` output.
     /// Otherwise, the unmatched event is instead silently discarded.
     #[configurable(metadata(docs::additional_props_description = "An individual route."))]
@@ -90,6 +237,7 @@ pub struct RouteConfig {
     route: IndexMap<String, AnyCondition>,
 }
 
+/// Generates example route configuration for documentation.
 fn route_examples() -> IndexMap<String, AnyCondition> {
     IndexMap::from([
         (
@@ -119,18 +267,36 @@ impl GenerateConfig for RouteConfig {
     }
 }
 
+/// Implementation of `TransformConfig` for route.
+///
+/// This implementation:
+/// 1. Validates that no route uses reserved names
+/// 2. Declares outputs for each route plus optional _unmatched
+/// 3. Enables parallelization (routing is stateless)
 #[async_trait::async_trait]
 #[typetag::serde(name = "route")]
 impl TransformConfig for RouteConfig {
+    /// Builds the runtime route transform.
+    ///
+    /// Creates a `Route` struct and wraps it in `Transform::synchronous()`.
+    /// We use synchronous (not function) because we have multiple named outputs.
     async fn build(&self, context: &TransformContext) -> crate::Result<Transform> {
         let route = Route::new(self, context)?;
         Ok(Transform::synchronous(route))
     }
 
+    /// Declares that route accepts all event types.
+    ///
+    /// Routing conditions can check any event type. A VRL condition like
+    /// `exists(.level)` works on logs but just returns false on metrics.
     fn input(&self) -> Input {
         Input::all()
     }
 
+    /// Validates that no route uses reserved names.
+    ///
+    /// This is called during config validation, before building.
+    /// Returns all validation errors at once for better UX.
     fn validate(&self, _: &schema::Definition) -> Result<(), Vec<String>> {
         if self.route.contains_key(UNMATCHED_ROUTE) {
             Err(vec![format!(
@@ -141,11 +307,20 @@ impl TransformConfig for RouteConfig {
         }
     }
 
+    /// Declares the outputs for this transform.
+    ///
+    /// For each route in the config, we create a named output with that route's name.
+    /// If `reroute_unmatched` is true, we also create an "_unmatched" output.
+    ///
+    /// Each output:
+    /// - Passes through events unchanged (same schema as input)
+    /// - Has a named port matching the route name
     fn outputs(
         &self,
         _: &TransformContext,
         input_definitions: &[(OutputId, schema::Definition)],
     ) -> Vec<TransformOutput> {
+        // Create an output for each named route
         let mut result: Vec<TransformOutput> = self
             .route
             .keys()
@@ -157,6 +332,8 @@ impl TransformConfig for RouteConfig {
                 .with_port(output_name)
             })
             .collect();
+
+        // Optionally add the _unmatched output
         if self.reroute_unmatched {
             result.push(
                 TransformOutput::new(
@@ -169,6 +346,10 @@ impl TransformConfig for RouteConfig {
         result
     }
 
+    /// Enables parallel execution for better throughput.
+    ///
+    /// Routing is stateless (each event is evaluated independently), so it's
+    /// safe to parallelize. Multiple workers can evaluate routes concurrently.
     fn enable_concurrency(&self) -> bool {
         true
     }

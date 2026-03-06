@@ -1,3 +1,68 @@
+//! The `aggregate` transform - time-windowed metric aggregation.
+//!
+//! This transform demonstrates `TaskTransform` - the most powerful transform type that
+//! takes full ownership of an event stream. It's used for stateful, async, or windowed
+//! operations that can't be done event-by-event.
+//!
+//! # Why This Is a TaskTransform
+//!
+//! The aggregate transform MUST use `TaskTransform` because it:
+//! 1. **Buffers events across time windows** - Collects metrics for N seconds
+//! 2. **Maintains state** - Keeps running totals, min/max, etc.
+//! 3. **Emits on a schedule** - Flushes aggregated results periodically
+//! 4. **Controls timing** - Uses timers to know when to flush
+//!
+//! These requirements can't be met with `FunctionTransform` or `SyncTransform`,
+//! which process one event at a time with no timing control.
+//!
+//! # How It Works
+//!
+//! ```ignore
+//! // Input stream: metrics arriving over time
+//! [metric(value=1), metric(value=1), metric(value=1), ...]
+//!
+//! // Aggregate buffers them for 10 seconds:
+//! Time 0-10s: Collect {value=1, value=1, value=1, ...}
+//! Time 10s:   Flush aggregated metric {value=1547}
+//!
+//! // Output stream: one metric per window
+//! [metric(value=1547)], [metric(value=1603)], ...
+//! ```
+//!
+//! # Aggregation Modes
+//!
+//! The transform supports multiple aggregation strategies:
+//!
+//! - **Auto**: Sum incremental metrics, use latest for absolute
+//! - **Sum**: Add up all values (counters only)
+//! - **Latest**: Use the most recent value (gauges only)
+//! - **Count**: Count how many metrics arrived
+//! - **Diff**: Difference between latest and previous
+//! - **Max/Min**: Track max or min value
+//! - **Mean/Stdev**: Calculate average or standard deviation
+//!
+//! # Example Configuration
+//!
+//! ```yaml
+//! transforms:
+//!   my_aggregator:
+//!     type: aggregate
+//!     inputs: ["my_metrics"]
+//!     interval_ms: 10000  # 10 second windows
+//!     mode: sum
+//! ```
+//!
+//! # Performance Characteristics
+//!
+//! Unlike `FunctionTransform` which can be parallelized, `TaskTransform` runs as
+//! a single task. This is necessary because:
+//! - Multiple workers would have inconsistent state
+//! - Window timing requires a single coordinator
+//! - Aggregation requires seeing all events
+//!
+//! The trade-off is higher overhead (separate task) but the only way to do
+//! stateful, windowed operations.
+
 use std::{
     collections::{HashMap, hash_map::Entry},
     pin::Pin,
@@ -23,6 +88,9 @@ use crate::{
 };
 
 /// Configuration for the `aggregate` transform.
+///
+/// This is a simple config - just the flush interval and aggregation mode.
+/// The complexity is in the runtime implementation, not the configuration.
 #[configurable_component(transform("aggregate", "Aggregate metrics passing through a topology."))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -33,6 +101,7 @@ pub struct AggregateConfig {
     #[serde(default = "default_interval_ms")]
     #[configurable(metadata(docs::human_name = "Flush Interval"))]
     pub interval_ms: u64,
+
     /// Function to use for aggregation.
     ///
     /// Some of the functions may only function on incremental and some only on absolute metrics.
@@ -41,36 +110,60 @@ pub struct AggregateConfig {
     pub mode: AggregationMode,
 }
 
+/// Aggregation strategies for combining metrics.
+///
+/// Different modes are appropriate for different metric types and use cases:
+///
+/// - **Incremental metrics** (counters): Values represent deltas since last read
+/// - **Absolute metrics** (gauges): Values represent current state
 #[configurable_component]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[configurable(description = "The aggregation mode to use.")]
 pub enum AggregationMode {
     /// Default mode. Sums incremental metrics and uses the latest value for absolute metrics.
+    ///
+    /// This is the "do the right thing" mode that handles mixed metric types.
     #[default]
     Auto,
 
-    /// Sums incremental metrics, ignores absolute
+    /// Sums incremental metrics, ignores absolute.
+    ///
+    /// Use for counter-style metrics where you want total counts per window.
     Sum,
 
-    /// Returns the latest value for absolute metrics, ignores incremental
+    /// Returns the latest value for absolute metrics, ignores incremental.
+    ///
+    /// Use for gauge-style metrics where you want the most recent reading.
     Latest,
 
-    /// Counts metrics for incremental and absolute metrics
+    /// Counts metrics for incremental and absolute metrics.
+    ///
+    /// Produces a counter showing how many metrics were seen per series.
     Count,
 
-    /// Returns difference between latest value for absolute, ignores incremental
+    /// Returns difference between latest value for absolute, ignores incremental.
+    ///
+    /// Use for gauges where you want to track changes, not absolute values.
     Diff,
 
-    /// Max value of absolute metric, ignores incremental
+    /// Max value of absolute metric, ignores incremental.
+    ///
+    /// Use for gauges where you want peak values per window.
     Max,
 
-    /// Min value of absolute metric, ignores incremental
+    /// Min value of absolute metric, ignores incremental.
+    ///
+    /// Use for gauges where you want minimum values per window.
     Min,
 
-    /// Mean value of absolute metric, ignores incremental
+    /// Mean value of absolute metric, ignores incremental.
+    ///
+    /// Use for gauges where you want average values per window.
     Mean,
 
-    /// Stdev value of absolute metric, ignores incremental
+    /// Stdev value of absolute metric, ignores incremental.
+    ///
+    /// Use for gauges where you want standard deviation per window.
     Stdev,
 }
 
@@ -79,22 +172,42 @@ const fn default_mode() -> AggregationMode {
 }
 
 const fn default_interval_ms() -> u64 {
-    10 * 1000
+    10 * 1000 // 10 seconds
 }
 
 impl_generate_config_from_default!(AggregateConfig);
 
+/// Implementation of `TransformConfig` for aggregate.
+///
+/// This implementation shows how to build a `TaskTransform`:
+/// 1. Create the runtime struct
+/// 2. Wrap it with `Transform::event_task()` (note: NOT `Transform::task()`)
+///
+/// The `event_task()` wrapper is for transforms that work with individual events.
+/// The `task()` wrapper is for transforms that work with event batches (EventArray).
 #[async_trait::async_trait]
 #[typetag::serde(name = "aggregate")]
 impl TransformConfig for AggregateConfig {
+    /// Builds the runtime aggregate transform.
+    ///
+    /// This creates an `Aggregate` struct and wraps it with `Transform::event_task()`.
+    /// The transform takes ownership of the input stream and controls when events are emitted.
     async fn build(&self, _context: &TransformContext) -> crate::Result<Transform> {
         Aggregate::new(self).map(Transform::event_task)
     }
 
+    /// Declares that aggregate only accepts metric events.
+    ///
+    /// Aggregation only makes sense for metrics. Logs and traces don't have
+    /// numeric values to aggregate.
     fn input(&self) -> Input {
         Input::metric()
     }
 
+    /// Declares that aggregate produces metric events.
+    ///
+    /// The output is aggregated metrics with the same series (name, tags, etc.)
+    /// but combined values according to the aggregation mode.
     fn outputs(
         &self,
         _: &TransformContext,
@@ -104,18 +217,69 @@ impl TransformConfig for AggregateConfig {
     }
 }
 
+/// Internal type for storing metric data with its metadata.
+///
+/// Metrics have two parts:
+/// - `MetricData`: The value, kind (incremental/absolute), and timestamp
+/// - `EventMetadata`: Source info, schema definition, etc.
+///
+/// We need to track both during aggregation to produce correct output events.
 type MetricEntry = (MetricData, EventMetadata);
 
+/// The runtime aggregate transform.
+///
+/// This struct implements `TaskTransform` and maintains all the state needed
+/// for time-windowed aggregation:
+///
+/// - **interval**: How often to flush aggregated metrics
+/// - **map**: Current window's metrics being aggregated (for most modes)
+/// - **prev_map**: Previous window's metrics (for Diff mode)
+/// - **multi_map**: Multiple values per series (for Mean/Stdev modes)
+/// - **mode**: The aggregation strategy
+///
+/// # State Management
+///
+/// The `map` field is the key data structure. It's indexed by `MetricSeries`
+/// (name + tags + namespace) so that metrics with the same identity get
+/// aggregated together.
+///
+/// ```ignore
+/// map = {
+///     MetricSeries { name: "requests", tags: {host: "a"} } => (value: 100, ...),
+///     MetricSeries { name: "requests", tags: {host: "b"} } => (value: 200, ...),
+/// }
+/// ```
+///
+/// Each series is aggregated independently.
 #[derive(Debug)]
 pub struct Aggregate {
+    /// How often to flush the aggregated metrics.
     interval: Duration,
+
+    /// Current window's aggregated metrics.
+    ///
+    /// Key: The metric series (identity)
+    /// Value: The aggregated (MetricData, EventMetadata)
     map: HashMap<MetricSeries, MetricEntry>,
+
+    /// Previous window's metrics (for Diff mode).
+    ///
+    /// Diff mode needs to know the previous value to compute the difference.
+    /// This map stores the last window's values.
     prev_map: HashMap<MetricSeries, MetricEntry>,
+
+    /// Multiple values per series (for Mean/Stdev modes).
+    ///
+    /// These modes need ALL values from the window, not just an aggregated one.
+    /// This map stores a Vec of all values seen.
     multi_map: HashMap<MetricSeries, Vec<MetricEntry>>,
+
+    /// The aggregation strategy to use.
     mode: AggregationMode,
 }
 
 impl Aggregate {
+    /// Creates a new aggregate transform with the given configuration.
     pub fn new(config: &AggregateConfig) -> crate::Result<Self> {
         Ok(Self {
             interval: Duration::from_millis(config.interval_ms),
@@ -126,6 +290,20 @@ impl Aggregate {
         })
     }
 
+    /// Records a metric event into the appropriate aggregation buffer.
+    ///
+    /// This is called for each incoming metric. The method:
+    /// 1. Extracts the metric's series and value
+    /// 2. Looks up or creates an entry in the appropriate map
+    /// 3. Combines the new value with existing values (per the mode)
+    ///
+    /// # Mode-Specific Behavior
+    ///
+    /// - **Auto/Sum**: Adds to existing counter value
+    /// - **Latest**: Overwrites with new value
+    /// - **Count**: Increments a counter
+    /// - **Max/Min**: Compares and keeps winner
+    /// - **Mean/Stdev**: Appends to a Vec for later calculation
     fn record(&mut self, event: Event) {
         let (series, data, metadata) = event.into_metric().into_parts();
 
@@ -168,6 +346,10 @@ impl Aggregate {
         emit!(AggregateEventRecorded);
     }
 
+    /// Records a metric for counting.
+    ///
+    /// Creates a counter that increments by 1 for each metric seen.
+    /// The counter tracks how many times each series appeared.
     fn record_count(
         &mut self,
         series: MetricSeries,
@@ -187,6 +369,10 @@ impl Aggregate {
         }
     }
 
+    /// Records a metric for summing (counters only).
+    ///
+    /// Adds the new value to the existing counter value.
+    /// Only works for incremental metrics (counters).
     fn record_sum(&mut self, series: MetricSeries, data: MetricData, metadata: EventMetadata) {
         match data.kind {
             MetricKind::Incremental => match self.map.entry(series) {
@@ -208,6 +394,10 @@ impl Aggregate {
         }
     }
 
+    /// Records a metric for max/min comparison (gauges only).
+    ///
+    /// Compares the new value with the existing value and keeps the winner.
+    /// Only works for absolute metrics (gauges).
     fn record_comparison(
         &mut self,
         series: MetricSeries,
@@ -247,10 +437,23 @@ impl Aggregate {
         }
     }
 
+    /// Flushes all aggregated metrics to the output.
+    ///
+    /// This is called when the interval timer fires. The method:
+    /// 1. Takes ownership of the current maps (clears them for next window)
+    /// 2. Computes final aggregated values
+    /// 3. For Diff mode, computes differences from previous window
+    /// 4. For Mean/Stdev, calculates statistics from collected values
+    /// 5. Emits all results to the output Vec
     fn flush_into(&mut self, output: &mut Vec<Event>) {
+        // Take the current map (this clears it for the next window)
         let map = std::mem::take(&mut self.map);
+
+        // Emit each aggregated metric
         for (series, entry) in map.clone().into_iter() {
             let mut metric = Metric::from_parts(series, entry.0, entry.1);
+
+            // For Diff mode, subtract previous window's value
             if matches!(self.mode, AggregationMode::Diff)
                 && let Some(prev_entry) = self.prev_map.get(metric.series())
                 && metric.data().kind == prev_entry.0.kind
@@ -261,12 +464,14 @@ impl Aggregate {
             output.push(Event::Metric(metric));
         }
 
+        // Handle Mean/Stdev modes which need all values
         let multi_map = std::mem::take(&mut self.multi_map);
         'outer: for (series, entries) in multi_map.into_iter() {
             if entries.is_empty() {
                 continue;
             }
 
+            // Sum all values
             let (mut final_sum, mut final_metadata) = entries.first().unwrap().clone();
             for (data, metadata) in entries.iter().skip(1) {
                 if !final_sum.update(data) {
@@ -277,6 +482,7 @@ impl Aggregate {
                 final_metadata.merge(metadata.clone());
             }
 
+            // Calculate mean
             let final_mean_value = if let MetricValue::Gauge { value } = final_sum.value_mut() {
                 // Entries are not empty so this is safe.
                 *value /= entries.len() as f64;
@@ -292,6 +498,7 @@ impl Aggregate {
                     output.push(Event::Metric(metric));
                 }
                 AggregationMode::Stdev => {
+                    // Calculate variance
                     let variance = entries
                         .iter()
                         .filter_map(|(data, _)| {
@@ -304,6 +511,8 @@ impl Aggregate {
                         })
                         .sum::<f64>()
                         / entries.len() as f64;
+
+                    // Standard deviation is sqrt(variance)
                     let mut final_stdev = final_mean;
                     if let MetricValue::Gauge { value } = final_stdev.value_mut() {
                         *value = variance.sqrt()
@@ -315,11 +524,65 @@ impl Aggregate {
             }
         }
 
+        // Save current map for next window's Diff calculation
         self.prev_map = map;
         emit!(AggregateFlushed);
     }
 }
 
+/// The `TaskTransform` implementation - full control over the event stream.
+///
+/// This is where the power (and complexity) of `TaskTransform` becomes clear.
+/// Unlike `FunctionTransform` or `SyncTransform`, we:
+/// - Own the entire input stream
+/// - Decide WHEN to emit events (timer-based)
+/// - Maintain state across events
+/// - Use async operations (timers, select!)
+///
+/// # The Stream Pattern
+///
+/// TaskTransform transforms one stream into another. We use `async_stream::stream!`
+/// to create the output stream with a `yield` syntax similar to Python generators:
+///
+/// ```ignore
+/// Box::pin(stream! {
+///     // This becomes a Stream<Item = Event>
+///     yield event1;
+///     yield event2;
+///     // ...
+/// })
+/// ```
+///
+/// # The Event Loop
+///
+/// The core of this transform is a `tokio::select!` loop that handles two cases:
+///
+/// 1. **Timer tick**: Flush aggregated metrics and emit them
+/// 2. **New event**: Record it in the aggregation buffer
+///
+/// ```ignore
+/// loop {
+///     tokio::select! {
+///         _ = timer.tick() => {
+///             // Time to flush! Emit aggregated metrics.
+///             flush_into(&mut output);
+///         }
+///         event = input.next() => {
+///             // New metric arrived. Add to buffer.
+///             record(event);
+///         }
+///     }
+/// }
+/// ```
+///
+/// # Shutdown Handling
+///
+/// When the input stream ends (`input.next()` returns None), we:
+/// 1. Flush any remaining aggregated metrics
+/// 2. Set `done = true` to exit the loop
+/// 3. Any remaining events in `output` are yielded before returning
+///
+/// This ensures no metrics are lost during shutdown.
 impl TaskTransform<Event> for Aggregate {
     fn transform(
         mut self: Box<Self>,
@@ -328,26 +591,42 @@ impl TaskTransform<Event> for Aggregate {
     where
         Self: 'static,
     {
+        // Create a timer that fires every `interval` duration
         let mut flush_stream = tokio::time::interval(self.interval);
 
         Box::pin(stream! {
+            // Buffer for collecting output events
             let mut output = Vec::new();
             let mut done = false;
+
+            // Main event loop
             while !done {
+                // `tokio::select!` waits for multiple async operations
+                // It runs the first one that becomes ready
                 tokio::select! {
+                    // Case 1: Timer fired - flush aggregated metrics
                     _ = flush_stream.tick() => {
+                        // Flush all aggregated metrics to output
                         self.flush_into(&mut output);
                     },
+
+                    // Case 2: New event arrived - record it
                     maybe_event = input_rx.next() => {
                         match maybe_event {
                             None => {
+                                // Input stream closed - final flush and exit
                                 self.flush_into(&mut output);
                                 done = true;
                             }
-                            Some(event) => self.record(event),
+                            Some(event) => {
+                                // Record the metric in our aggregation buffer
+                                self.record(event);
+                            }
                         }
                     }
                 };
+
+                // Yield any events that were generated
                 for event in output.drain(..) {
                     yield event;
                 }
