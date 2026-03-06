@@ -1,3 +1,8 @@
+//! SourceSender - The primary interface for sources to emit events.
+//!
+//! This module provides the `SourceSender` type, which is passed to every source
+//! as part of `SourceContext`. Sources use it to send events into the pipeline.
+
 #[cfg(any(test, feature = "test"))]
 use std::time::Duration;
 use std::{collections::HashMap, time::Instant};
@@ -34,6 +39,22 @@ use crate::{
 };
 
 /// SourceSenderItem is a thin wrapper around [EventArray] used to track the send duration of a batch.
+///
+/// # Why This Wrapper Exists
+///
+/// You might wonder why we don't just send `EventArray` directly through the channel.
+/// The answer is **lag time tracking**.
+///
+/// We want to measure how long it takes for events to flow from the source to the
+/// transform/sink. This requires tracking when the batch was created. But `EventArray`
+/// doesn't have a timestamp field - it's a pure data container.
+///
+/// Instead of modifying `EventArray`, we wrap it in `SourceSenderItem`:
+/// - `events`: The actual batch of events
+/// - `send_reference`: The instant when the batch was created
+///
+/// The receiver uses `send_reference` to calculate the lag time when the batch
+/// is finally processed.
 ///
 /// This is needed because the send duration is calculated as the difference between when the batch
 /// is sent from the origin component to when the batch is enqueued on the receiving component's input buffer.
@@ -89,6 +110,42 @@ impl From<SourceSenderItem> for EventArray {
     }
 }
 
+/// The primary interface for sources to send events into the pipeline.
+///
+/// # How Sources Use SourceSender
+///
+/// Sources receive a `SourceSender` in their `SourceContext`. They use it to
+/// send events via one of these methods:
+///
+/// ```ignore
+/// // Send a single event
+/// out.send_event(event).await?;
+///
+/// // Send a batch of events (more efficient for bulk operations)
+/// out.send_batch(vec![event1, event2, event3]).await?;
+///
+/// // Send to a named output (for multi-output sources)
+/// out.send_batch_named("errors", error_events).await?;
+/// ```
+///
+/// # Internal Structure
+///
+/// SourceSender has two types of outputs:
+///
+/// - **default_output**: The primary output that most sources use. This is
+///   the unnamed output that connects to downstream transforms/sinks.
+///
+/// - **named_outputs**: Additional outputs for sources that produce multiple
+///   types of data (e.g., OpenTelemetry produces logs, metrics, and traces).
+///
+/// # Why Clone?
+///
+/// SourceSender is `Clone` because some sources spawn multiple concurrent tasks
+/// that all need to send events. For example, an HTTP server source spawns a
+/// task per connection, and each task needs its own `SourceSender` handle.
+///
+/// Cloning is cheap - it only clones the channel sender reference, not the
+/// underlying buffer.
 #[derive(Debug, Clone)]
 pub struct SourceSender {
     // The default output is optional because some sources, e.g. `datadog_agent`
@@ -98,6 +155,13 @@ pub struct SourceSender {
 }
 
 impl SourceSender {
+    /// Creates a new builder for constructing a SourceSender.
+    ///
+    /// The builder pattern is used because SourceSender needs to be configured
+    /// with its outputs before being used. The topology system uses this to:
+    /// 1. Create a builder
+    /// 2. Add outputs (channels) for each declared output
+    /// 3. Build the final SourceSender
     pub fn builder() -> Builder {
         Builder::default()
     }
@@ -130,6 +194,11 @@ impl SourceSender {
         )
     }
 
+    /// Creates a test sender and receiver pair.
+    ///
+    /// This is used extensively in source unit tests to verify events
+    /// are produced correctly. The returned stream yields individual
+    /// events, making it easy to assert on event content.
     #[cfg(any(test, feature = "test"))]
     pub fn new_test() -> (Self, impl Stream<Item = Event> + Unpin) {
         let (pipe, recv) = Self::new_test_sender_with_options(TEST_BUFFER_SIZE, None);
@@ -137,6 +206,12 @@ impl SourceSender {
         (pipe, recv)
     }
 
+    /// Creates a test sender that automatically finalizes events with the given status.
+    ///
+    /// This is useful for testing acknowledgement behavior. When testing sources
+    /// that support acknowledgements, you need to simulate the sink confirming
+    /// delivery. This method creates a receiver that automatically marks events
+    /// as delivered (or errored) when they're received.
     #[cfg(any(test, feature = "test"))]
     pub fn new_test_finalize(status: EventStatus) -> (Self, impl Stream<Item = Event> + Unpin) {
         let (pipe, recv) = Self::new_test_sender_with_options(TEST_BUFFER_SIZE, None);
@@ -211,7 +286,20 @@ impl SourceSender {
         self.default_output.as_mut().expect("no default output")
     }
 
-    /// Send an event to the default output.
+    /// Send a single event to the default output.
+    ///
+    /// # When To Use This vs send_batch()
+    ///
+    /// Use `send_event()` when:
+    /// - Events arrive one at a time (e.g., reading from a socket)
+    /// - The source doesn't naturally batch data
+    ///
+    /// Use `send_batch()` when:
+    /// - You have multiple events ready to send
+    /// - You're processing data in chunks (e.g., reading from a file)
+    ///
+    /// `send_event()` forwards exactly what you provide (as an `EventArray`)
+    /// to the default output.
     ///
     /// This internally handles emitting [EventsSent] and [ComponentEventsDropped] events.
     pub async fn send_event(&mut self, event: impl Into<EventArray>) -> Result<(), SendError> {
@@ -219,6 +307,10 @@ impl SourceSender {
     }
 
     /// Send a stream of events to the default output.
+    ///
+    /// This is useful when you have an async stream producing events (e.g.,
+    /// from a codec decoder). The method automatically chunks the stream
+    /// into batches of `CHUNK_SIZE` for efficiency.
     ///
     /// This internally handles emitting [EventsSent] and [ComponentEventsDropped] events.
     pub async fn send_event_stream<S, E>(&mut self, events: S) -> Result<(), SendError>
@@ -231,6 +323,15 @@ impl SourceSender {
 
     /// Send a batch of events to the default output.
     ///
+    /// # Why Batching Matters
+    ///
+    /// `send_batch()` chunks large iterators into `CHUNK_SIZE` event arrays
+    /// before sending to the channel. This is typically more efficient than
+    /// many single-event sends because:
+    /// - You know the exact size upfront, avoiding reallocations
+    /// - Events are kept together in the same chunk
+    /// - Fewer method calls
+    ///
     /// This internally handles emitting [EventsSent] and [ComponentEventsDropped] events.
     pub async fn send_batch<I, E>(&mut self, events: I) -> Result<(), SendError>
     where
@@ -241,7 +342,21 @@ impl SourceSender {
         self.default_output_mut().send_batch(events).await
     }
 
-    /// Send a batch of events event to a named output.
+    /// Send a batch of events to a named output.
+    ///
+    /// # Named Outputs
+    ///
+    /// Some sources produce multiple types of data. For example, the OpenTelemetry
+    /// source can output logs, metrics, AND traces. Each type goes to a separate
+    /// named output, which can be routed to different transforms/sinks.
+    ///
+    /// Named outputs are declared in `SourceConfig::outputs()`:
+    /// ```ignore
+    /// vec![
+    ///     SourceOutput::new_maybe_logs(DataType::Log, schema),
+    ///     SourceOutput::new_maybe_metrics(DataType::Metric, schema),
+    /// ]
+    /// ```
     ///
     /// This internally handles emitting [EventsSent] and [ComponentEventsDropped] events.
     pub async fn send_batch_named<I, E>(&mut self, name: &str, events: I) -> Result<(), SendError>

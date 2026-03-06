@@ -1,3 +1,25 @@
+//! Output - A single output channel from a source.
+//!
+//! Each source can have one or more outputs. Each output is represented by
+//! an `Output` instance, which wraps a channel sender and handles:
+//!
+//! - Batching events into chunks
+//! - Tracking send timing for lag metrics
+//! - Attaching schema definitions to events
+//! - Handling send timeouts and errors
+//!
+//! # The Relationship Between SourceSender and Output
+//!
+//! ```
+//! SourceSender
+//!   |- default_output: Output  (unnamed output, used by most sources)
+//!   `- named_outputs: HashMap<String, Output>  (for multi-output sources)
+//! ```
+//!
+//! When a source calls `out.send_batch(events)`, it's delegating to the
+//! default `Output`. When it calls `out.send_batch_named("traces", events)`,
+//! it's using a named `Output`.
+
 use std::{
     fmt,
     num::NonZeroUsize,
@@ -30,15 +52,30 @@ use crate::{
     schema::Definition,
 };
 
+/// Metric prefix for source buffer utilization.
 const UTILIZATION_METRIC_PREFIX: &str = "source_buffer";
 
-/// UnsentEvents tracks the number of events yet to be sent in the buffer. This is used to
-/// increment the appropriate counters when a future is not polled to completion. Particularly,
-/// this is known to happen in a Warp server when a client sends a new HTTP request on a TCP
-/// connection that already has a pending request.
+/// Tracks events that haven't been sent yet.
 ///
-/// If its internal count is greater than 0 when dropped, the appropriate [ComponentEventsDropped]
-/// event is emitted.
+/// # Why This Struct Exists
+///
+/// When a source calls `send_batch()`, it's possible for the future to be
+/// cancelled before completion. This can happen in HTTP servers when a client
+/// sends a new request on a connection that has a pending request.
+///
+/// If we don't track unsent events, they would be silently dropped without
+/// any telemetry. This struct ensures that dropped events are properly
+/// counted and logged.
+///
+/// # How It Works
+///
+/// 1. When sending starts, we create `UnsentEventCount::new(count)`
+/// 2. As events are successfully sent, we call `decr(count)`
+/// 3. If the future is dropped before completion, `Drop::drop` emits
+///    a `ComponentEventsDropped` event with the remaining count
+///
+/// This pattern ensures we never lose track of events, even when futures
+/// are cancelled unexpectedly.
 pub(super) struct UnsentEventCount {
     count: usize,
     span: Span,
@@ -52,14 +89,17 @@ impl UnsentEventCount {
         }
     }
 
+    /// Decrease the count when events are successfully sent.
     const fn decr(&mut self, count: usize) {
         self.count = self.count.saturating_sub(count);
     }
 
+    /// Discard tracking - used when we're about to emit a different error.
     const fn discard(&mut self) {
         self.count = 0;
     }
 
+    /// Called when send times out - emits the appropriate telemetry.
     fn timed_out(&mut self) {
         ComponentEventsTimedOut {
             reason: "Source send timed out.",
@@ -72,6 +112,7 @@ impl UnsentEventCount {
 
 impl Drop for UnsentEventCount {
     fn drop(&mut self) {
+        // If we still have unsent events, emit a telemetry event
         if self.count > 0 {
             let _enter = self.span.enter();
             internal_event::emit(ComponentEventsDropped::<UNINTENTIONAL> {
@@ -82,6 +123,29 @@ impl Drop for UnsentEventCount {
     }
 }
 
+/// A single output channel from a source.
+///
+/// # Anatomy of an Output
+///
+/// An `Output` contains:
+///
+/// - **sender**: The channel to send events through. This is a `LimitedSender`,
+///   which means it has backpressure - when the buffer is full, sends block.
+///
+/// - **lag_time**: Histogram metric tracking how long events wait before being
+///   processed. This measures "source lag" - if a source generates events faster
+///   than downstream can process, lag increases.
+///
+/// - **events_sent**: Telemetry handle for counting events that successfully
+///   flow through this output.
+///
+/// - **log_definition**: Schema definition for log events. This is attached
+///   to each event as it passes through, enabling schema-aware processing.
+///
+/// - **id**: The output identifier, used for acknowledgements and routing.
+///
+/// - **timeout**: Optional timeout for send operations. If the channel is
+///   blocked for longer than this, the send fails with a timeout error.
 #[derive(Clone)]
 pub(super) struct Output {
     sender: LimitedSender<SourceSenderItem>,
@@ -108,6 +172,25 @@ impl fmt::Debug for Output {
 }
 
 impl Output {
+    /// Creates a new output with its associated buffer channel.
+    ///
+    /// # Parameters
+    ///
+    /// - `n`: Maximum number of events the buffer can hold
+    /// - `output`: Name of this output (for metrics)
+    /// - `lag_time`: Optional histogram for tracking event lag
+    /// - `log_definition`: Schema definition for events
+    /// - `output_id`: Identifier for this output
+    /// - `timeout`: Optional send timeout
+    ///
+    /// # Returns
+    ///
+    /// Returns a tuple of:
+    /// 1. The `Output` instance (used by the source to send events)
+    /// 2. A `LimitedReceiver` (used by the topology to receive events)
+    ///
+    /// The sender and receiver are connected by a bounded channel with
+    /// backpressure. When the buffer is full, sends will block (or timeout).
     pub(super) fn new_with_buffer(
         n: usize,
         output: String,
@@ -135,6 +218,21 @@ impl Output {
         )
     }
 
+    /// Core send implementation that handles batching and metadata.
+    ///
+    /// # What This Does
+    ///
+    /// 1. Records the send start time for lag tracking
+    /// 2. Attaches lag time metrics to each event
+    /// 3. Attaches schema definitions to events
+    /// 4. Attaches the output ID to events (for acknowledgements)
+    /// 5. Sends through the channel (with optional timeout)
+    /// 6. Emits telemetry for successful sends
+    ///
+    /// # Error Handling
+    ///
+    /// - If the channel is closed, returns `SendError::Closed`
+    /// - If timeout is configured and send takes too long, returns `SendError::Timeout`
     pub(super) async fn send(
         &mut self,
         mut events: EventArray,
@@ -147,10 +245,12 @@ impl Output {
             .for_each(|event| self.emit_lag_time(event, reference));
 
         events.iter_events_mut().for_each(|mut event| {
-            // attach runtime schema definitions from the source
+            // Attach runtime schema definitions from the source
+            // This enables schema-aware processing downstream
             if let Some(log_definition) = &self.log_definition {
                 event.metadata_mut().set_schema_definition(log_definition);
             }
+            // Set the upstream ID for acknowledgement tracking
             event.metadata_mut().set_upstream_id(Arc::clone(&self.id));
         });
 
@@ -162,6 +262,18 @@ impl Output {
         Ok(())
     }
 
+    /// Sends events through the channel with optional timeout.
+    ///
+    /// # Timeout Behavior
+    ///
+    /// If `timeout` is set:
+    /// - Wraps the send in `tokio::time::timeout`
+    /// - Returns `SendError::Timeout` if the timeout elapses
+    /// - This allows sources to fail fast when downstream is too slow
+    ///
+    /// If `timeout` is not set:
+    /// - Send will block indefinitely until buffer has space
+    /// - This is the default behavior (backpressure propagates to source)
     async fn send_with_timeout(
         &mut self,
         events: EventArray,
@@ -182,14 +294,16 @@ impl Output {
         }
     }
 
+    /// Send a single event (or small batch).
+    ///
+    /// This is the primary method used by sources. The event is wrapped
+    /// in an `EventArray` and sent through the channel.
     pub(super) async fn send_event(
         &mut self,
         event: impl Into<EventArray>,
     ) -> Result<(), SendError> {
         let event: EventArray = event.into();
-        // It's possible that the caller stops polling this future while it is blocked waiting
-        // on `self.send()`. When that happens, we use `UnsentEventCount` to correctly emit
-        // `ComponentEventsDropped` events.
+        // Track unsent events in case the future is cancelled
         let mut unsent_event_count = UnsentEventCount::new(event.len());
         self.send(event, &mut unsent_event_count)
             .await
@@ -200,6 +314,11 @@ impl Output {
             })
     }
 
+    /// Send a stream of events, automatically chunking into batches.
+    ///
+    /// This is useful when you have an async stream of events (e.g., from
+    /// a codec decoder). The method uses `ready_chunks()` to group events
+    /// into batches of `CHUNK_SIZE` for efficiency.
     pub(super) async fn send_event_stream<S, E>(&mut self, events: S) -> Result<(), SendError>
     where
         S: Stream<Item = E> + Unpin,
@@ -212,15 +331,27 @@ impl Output {
         Ok(())
     }
 
+    /// Send a batch of events.
+    ///
+    /// # Why This Is Efficient
+    ///
+    /// When you have multiple events ready, sending them as a batch is more
+    /// efficient than individual sends:
+    /// - Fewer channel operations
+    /// - Better cache locality
+    /// - Events stay together through the pipeline
+    ///
+    /// # Chunking
+    ///
+    /// If the batch is larger than `CHUNK_SIZE`, it's automatically split
+    /// into multiple chunks. This prevents any single send from blocking
+    /// for too long.
     pub(super) async fn send_batch<I, E>(&mut self, events: I) -> Result<(), SendError>
     where
         E: Into<Event> + ByteSizeOf,
         I: IntoIterator<Item = E>,
         <I as IntoIterator>::IntoIter: ExactSizeIterator,
     {
-        // It's possible that the caller stops polling this future while it is blocked waiting
-        // on `self.send()`. When that happens, we use `UnsentEventCount` to correctly emit
-        // `ComponentEventsDropped` events.
         let events = events.into_iter().map(Into::into);
         let mut unsent_event_count = UnsentEventCount::new(events.len());
         for events in array::events_into_arrays(events, Some(CHUNK_SIZE)) {
@@ -240,9 +371,21 @@ impl Output {
         Ok(())
     }
 
-    /// Calculate the difference between the reference time and the
-    /// timestamp stored in the given event reference, and emit the
-    /// different, as expressed in milliseconds, as a histogram.
+    /// Calculate and emit the lag time for an event.
+    ///
+    /// # What Lag Time Measures
+    ///
+    /// Lag time is the difference between:
+    /// 1. When the event was created (timestamp in the event)
+    /// 2. When the event was sent through the output
+    ///
+    /// This metric helps identify:
+    /// - Sources generating events faster than downstream can process
+    /// - Backpressure building up in the pipeline
+    /// - Processing bottlenecks
+    ///
+    /// The value is emitted as a histogram metric, which can be used
+    /// to see the distribution of lag times (p50, p95, p99).
     pub(super) fn emit_lag_time(&self, event: EventRef<'_>, reference: i64) {
         if let Some(lag_time_metric) = &self.lag_time {
             let timestamp = match event {
