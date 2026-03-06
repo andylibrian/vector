@@ -12,10 +12,37 @@
 //! - Persistence across restarts (disk buffers)
 //! - In-memory buffering for throughput
 //!
+//! **Why Buffers?**
+//!
+//! External systems can't always accept data as fast as Vector produces it. Without buffers,
+//! a slow sink would block the entire pipeline. Buffers provide a cushion:
+//!
+//! ```text
+//! Fast Source → Transform → [BUFFER] → Slow External API
+//!                                    ↑
+//!                          Events queue up here
+//!                          instead of blocking
+//!                          the entire pipeline
+//! ```
+//!
+//! **Memory vs Disk Buffers:**
+//!
+//! - **Memory buffers**: Fast, but events are lost on restart/crash
+//! - **Disk buffers**: Durable, but slower (disk I/O)
+//!
+//! Production configs often use disk buffers for critical data (logs required for compliance)
+//! and memory buffers for best-effort data (metrics where occasional loss is acceptable).
+//!
 //! # Health Checks
 //!
 //! Sinks can have health checks that verify connectivity
 //! before Vector declares itself ready.
+//!
+//! **Why Health Checks?**
+//!
+//! Imagine Vector starts before the downstream database. Without health checks, Vector would
+//! accept data, fail to send it, and buffer it. With health checks, Vector refuses to start
+//! until the database is available, alerting operators immediately.
 //!
 //! # Implementing a Sink
 //!
@@ -461,6 +488,23 @@ pub trait SinkConfig: DynClone + NamedComponent + core::fmt::Debug + Send + Sync
     /// configured in a way that would deadlock the spawning of a topology, and as well, allows
     /// Vector to determine the correct order for rebuilding a topology during configuration reload
     /// when resources must first be reclaimed before being reassigned, and so on.
+    ///
+    /// # Disk Buffers as Resources
+    ///
+    /// Sinks with disk buffers claim a `DiskBuffer` resource. This prevents two sinks from
+    /// writing to the same buffer file, which would corrupt data:
+    ///
+    /// ```rust,ignore
+    /// fn resources(&self, id: &ComponentKey) -> Vec<Resource> {
+    ///     let mut resources = self.inner.resources();
+    ///     if let Some(disk_buffer) = &self.buffer.disk {
+    ///         resources.push(Resource::DiskBuffer(id.to_string()));
+    ///     }
+    ///     resources
+    /// }
+    /// ```
+    ///
+    /// The resource ID is the component key, so each sink gets its own buffer file.
     fn resources(&self) -> Vec<Resource> {
         Vec::new()
     }

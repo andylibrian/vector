@@ -197,6 +197,49 @@ impl SourceOuter {
 }
 
 /// Generalized interface for describing and building source components.
+///
+/// # Dynamic Dispatch with typetag
+///
+/// The `#[typetag::serde(tag = "type")]` attribute enables dynamic deserialization.
+/// When Vector parses a config like:
+///
+/// ```yaml
+/// sources:
+///   my_logs:
+///     type: file
+///     include: ["/var/log/*.log"]
+/// ```
+///
+/// The `type: file` field tells serde to look up the registered type "file"
+/// and deserialize the remaining fields into `FileConfig`.
+///
+/// # Why typetag Instead of a Match Statement?
+///
+/// A naive approach would be:
+/// ```rust,ignore
+/// match source_type {
+///     "file" => FileConfig::deserialize(...),
+///     "http" => HttpConfig::deserialize(...),
+///     // ... 47 more cases
+/// }
+/// ```
+///
+/// This has several problems:
+/// 1. **Coupling**: Every new source requires modifying this central match statement
+/// 2. **Feature flags**: Conditional compilation becomes messy with many branches
+/// 3. **Testability**: Can't easily mock/stub components in tests
+///
+/// typetag solves this by maintaining a global registry. Each source registers
+/// itself when its module is compiled:
+///
+/// ```rust,ignore
+/// #[typetag::serde(name = "file")]
+/// impl SourceConfig for FileConfig { ... }
+/// ```
+///
+/// When serde sees `type: "file"`, it looks up "file" in the registry and calls
+/// the registered deserializer. Adding a new source requires zero changes to
+/// the config loading code.
 #[async_trait]
 #[typetag::serde(tag = "type")]
 pub trait SourceConfig: DynClone + NamedComponent + core::fmt::Debug + Send + Sync {
@@ -220,17 +263,55 @@ pub trait SourceConfig: DynClone + NamedComponent + core::fmt::Debug + Send + Sy
     /// configured in a way that would deadlock the spawning of a topology, and as well, allows
     /// Vector to determine the correct order for rebuilding a topology during configuration reload
     /// when resources must first be reclaimed before being reassigned, and so on.
+    ///
+    /// # Example: TCP Port
+    ///
+    /// A `http_server` source might return:
+    /// ```rust,ignore
+    /// vec![Resource::tcp(self.address)]
+    /// ```
+    ///
+    /// The config validator checks that no two components claim the same port.
+    /// This prevents runtime errors like "address already in use" and enables
+    /// Vector to provide clear error messages at startup.
+    ///
+    /// # Example: File Descriptor
+    ///
+    /// The `stdin` source returns `vec![Resource::Fd(0)]` because only one
+    /// component can read from stdin. If you configure two stdin sources,
+    /// the validator catches this at config time, not runtime.
     fn resources(&self) -> Vec<Resource> {
         Vec::new()
     }
 
     /// Whether or not this source can acknowledge the events it emits.
     ///
+    /// # End-to-End Acknowledgements
+    ///
     /// Generally, Vector uses acknowledgements to track when an event has finally been processed,
-    /// either successfully or unsuccessfully. While it is used internally in some areas, such as
-    /// within disk buffers for knowing when a message can be deleted from the buffer, it is
-    /// primarily used to signal back to a source that a message has been successfully (durably)
-    /// processed or not.
+    /// either successfully or unsuccessfully. This enables "end-to-end" acknowledgements:
+    ///
+    /// ```text
+    /// Kafka Source → Transform → HTTP Sink
+    ///     ↓                              ↓
+    ///  "Don't commit       "Data received!"
+    ///   offset yet"             ↓
+    ///                      "Commit offset"
+    /// ```
+    ///
+    /// The Kafka source holds onto message offsets until the HTTP sink confirms delivery.
+    /// This guarantees "at-least-once" delivery semantics.
+    ///
+    /// # Why Not All Sources Support This?
+    ///
+    /// Some sources can't acknowledge:
+    /// - **File source**: Can't pause log rotation. Once a line is read, it's read.
+    /// - **Generator source**: No external system to coordinate with.
+    ///
+    /// For these sources, enabling acknowledgements would add overhead (tracking
+    /// events in memory) without any benefit. By exposing this capability, we can:
+    /// 1. Skip acknowledgement overhead for sources that don't need it
+    /// 2. Warn users if they enable acks in a topology that can't support them
     ///
     /// By exposing whether or not a source supports acknowledgements, we can avoid situations where
     /// using acknowledgements would only add processing overhead for no benefit to the source, as
