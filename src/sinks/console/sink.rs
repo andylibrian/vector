@@ -1,3 +1,7 @@
+//! Runtime implementation for the `console` sink.
+//!
+//! Events are transformed, encoded, and written to either `stdout` or `stderr`.
+
 use async_trait::async_trait;
 use bytes::BytesMut;
 use futures::{StreamExt, stream::BoxStream};
@@ -17,12 +21,19 @@ use crate::{
     sinks::util::StreamSink,
 };
 
+/// Console sink runtime.
 pub struct WriterSink<T> {
+    /// Output writer (`stdout` or `stderr`).
     pub output: T,
+
+    /// Event transformer configured by sink encoding settings.
     pub transformer: Transformer,
+
+    /// Event encoder (serializer + framer).
     pub encoder: Encoder<Framer>,
 }
 
+/// Writes each event to the configured output stream.
 #[async_trait]
 impl<T> StreamSink<Event> for WriterSink<T>
 where
@@ -31,6 +42,7 @@ where
     async fn run(mut self: Box<Self>, mut input: BoxStream<'_, Event>) -> Result<(), ()> {
         let bytes_sent = register!(BytesSent::from(Protocol("console".into(),)));
         let events_sent = register!(EventsSent::from(Output(None)));
+
         while let Some(mut event) = input.next().await {
             let event_byte_size = event.estimated_json_encoded_size_of();
             self.transformer.transform(&mut event);
@@ -38,21 +50,18 @@ where
             let finalizers = event.take_finalizers();
             let mut bytes = BytesMut::new();
             self.encoder.encode(event, &mut bytes).map_err(|_| {
-                // Error is handled by `Encoder`.
+                // `Encoder` already emits the underlying internal event.
                 finalizers.update_status(EventStatus::Errored);
             })?;
 
             match self.output.write_all(&bytes).await {
                 Err(error) => {
-                    // Error when writing to stdout/stderr is likely irrecoverable,
-                    // so stop the sink.
                     error!(message = "Error writing to output. Stopping sink.", %error, internal_log_rate_limit = false);
                     finalizers.update_status(EventStatus::Errored);
                     return Err(());
                 }
                 Ok(()) => {
                     finalizers.update_status(EventStatus::Delivered);
-
                     events_sent.emit(CountByteSize(1, event_byte_size));
                     bytes_sent.emit(ByteSize(bytes.len()));
                 }

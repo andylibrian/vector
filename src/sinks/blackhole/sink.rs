@@ -1,3 +1,8 @@
+//! Runtime for the `blackhole` sink.
+//!
+//! The sink drops all events, while still updating acknowledgements and metrics.
+//! Optional rate limiting and periodic counter logging are supported.
+
 use std::{
     sync::{
         Arc,
@@ -25,10 +30,18 @@ use crate::{
     sinks::{blackhole::config::BlackholeConfig, util::StreamSink},
 };
 
+/// Runtime state for the `blackhole` sink.
 pub struct BlackholeSink {
+    /// Total number of events received.
     total_events: Arc<AtomicUsize>,
+
+    /// Total estimated bytes received.
     total_raw_bytes: Arc<AtomicUsize>,
+
+    /// Sink configuration.
     config: BlackholeConfig,
+
+    /// Timestamp used for rate limiting.
     last: Option<Instant>,
 }
 
@@ -43,12 +56,11 @@ impl BlackholeSink {
     }
 }
 
+/// Drops incoming `EventArray` batches while tracking metrics and finalizers.
 #[async_trait]
 impl StreamSink<EventArray> for BlackholeSink {
     async fn run(mut self: Box<Self>, mut input: BoxStream<'_, EventArray>) -> Result<(), ()> {
-        // Spin up a task that does the periodic reporting.  This is decoupled from the main sink so
-        // that rate limiting support can be added more simply without having to interleave it with
-        // the printing.
+        // Reporting runs in a background task and reads these shared counters.
         let total_events = Arc::clone(&self.total_events);
         let total_raw_bytes = Arc::clone(&self.total_raw_bytes);
         let (shutdown, mut tripwire) = watch::channel(());
@@ -105,7 +117,6 @@ impl StreamSink<EventArray> for BlackholeSink {
             bytes_sent.emit(ByteSize(message_len.get()));
         }
 
-        // Notify the reporting task to shutdown.
         _ = shutdown.send(());
 
         Ok(())

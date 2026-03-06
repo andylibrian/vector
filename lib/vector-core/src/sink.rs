@@ -1,3 +1,12 @@
+//! Core sink runtime abstractions shared by Vector sinks.
+//!
+//! Vector supports two sink execution models:
+//! - `VectorSink::Sink`: a `futures::Sink<EventArray>` pipeline.
+//! - `VectorSink::Stream`: a custom `StreamSink<EventArray>` loop.
+//!
+//! The adapters in this module bridge per-event sinks (`Event`) to the
+//! topology-facing batch interface (`EventArray`).
+
 use std::{fmt, iter::IntoIterator, pin::Pin};
 
 use futures::{
@@ -7,17 +16,21 @@ use futures::{
 
 use crate::event::{Event, EventArray, EventContainer, into_event_stream};
 
+/// Unified sink wrapper used by the topology.
 pub enum VectorSink {
+    /// `futures::Sink`-based sink that consumes `EventArray` batches.
     Sink(Box<dyn Sink<EventArray, Error = ()> + Send + Unpin>),
+
+    /// Stream-based sink with a custom `run` loop.
     Stream(Box<dyn StreamSink<EventArray> + Send>),
 }
 
 impl VectorSink {
-    /// Run the `VectorSink`
+    /// Run the sink against an input stream of event batches.
     ///
     /// # Errors
     ///
-    /// It is unclear under what conditions this function will error.
+    /// Returns `Err(())` when the sink reports an unrecoverable runtime failure.
     pub async fn run(self, input: impl Stream<Item = EventArray> + Send) -> Result<(), ()> {
         match self {
             Self::Sink(sink) => input.map(Ok).forward(sink).await,
@@ -88,16 +101,18 @@ impl fmt::Debug for VectorSink {
 
 // === StreamSink ===
 
+/// Trait for stream-based sinks.
 #[async_trait::async_trait]
 pub trait StreamSink<T> {
+    /// Process the stream until completion or failure.
     async fn run(self: Box<Self>, input: stream::BoxStream<'_, T>) -> Result<(), ()>;
 }
 
-/// Wrapper for sinks implementing `Sink<Event>` to implement
-/// `Sink<EventArray>`. This stores an iterator over the incoming
-/// `EventArray` to be pushed into the wrapped sink one at a time.
+/// Adapter from `Sink<Event>` to `Sink<EventArray>`.
 struct EventSink<S> {
     sink: S,
+
+    /// Iterator of events from the in-flight batch.
     queue: Option<<EventArray as EventContainer>::IntoIter>,
 }
 
@@ -169,7 +184,7 @@ impl<S: Sink<Event> + Send + Unpin> Sink<EventArray> for EventSink<S> {
     }
 }
 
-/// Wrapper for sinks implementing `StreamSink<Event>` to implement `StreamSink<EventArray>`
+/// Adapter from `StreamSink<Event>` to `StreamSink<EventArray>`.
 struct EventStream<T> {
     sink: Box<T>,
 }

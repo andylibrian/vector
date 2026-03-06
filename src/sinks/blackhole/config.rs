@@ -1,3 +1,8 @@
+//! Configuration for the `blackhole` sink.
+//!
+//! This sink intentionally discards incoming events. It is useful for
+//! throughput testing, backpressure experiments, and pipeline debugging.
+
 use std::time::Duration;
 
 use futures::{FutureExt, future};
@@ -23,9 +28,9 @@ const fn default_print_interval_secs() -> Duration {
 #[serde(deny_unknown_fields, default)]
 #[derivative(Default)]
 pub struct BlackholeConfig {
-    /// The interval between reporting a summary of activity.
+    /// How often to log aggregate counters.
     ///
-    /// Set to `0` (default) to disable reporting.
+    /// Set to `0` (default) to disable periodic reporting.
     #[derivative(Default(value = "default_print_interval_secs()"))]
     #[serde(default = "default_print_interval_secs")]
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
@@ -33,12 +38,13 @@ pub struct BlackholeConfig {
     #[configurable(metadata(docs::examples = 10))]
     pub print_interval_secs: Duration,
 
-    /// The number of events, per second, that the sink is allowed to consume.
+    /// Maximum events per second to consume.
     ///
-    /// By default, there is no limit.
+    /// When set, the sink delays consumption to simulate a slower destination.
     #[configurable(metadata(docs::examples = 1000))]
     pub rate: Option<usize>,
 
+    /// Acknowledgement configuration.
     #[configurable(derived)]
     #[serde(
         default,

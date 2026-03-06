@@ -1,3 +1,7 @@
+//! Sink implementations and shared sink-level types.
+//!
+//! Individual sink modules are feature-gated and registered here.
+
 #![allow(missing_docs)]
 use futures::future::BoxFuture;
 use snafu::Snafu;
@@ -121,9 +125,10 @@ pub mod websocket_server;
 
 pub use vector_lib::{config::Input, sink::VectorSink};
 
+/// Sink healthcheck future.
 pub type Healthcheck = BoxFuture<'static, crate::Result<()>>;
 
-/// Common build errors
+/// Common errors when constructing sinks.
 #[derive(Debug, Snafu)]
 pub enum BuildError {
     #[snafu(display("Unable to resolve DNS for {:?}", address))]
@@ -138,7 +143,7 @@ pub enum BuildError {
     HTTPRequestBuilderError { source: ::http::Error },
 }
 
-/// Common healthcheck errors
+/// Common sink healthcheck failures.
 #[derive(Debug, Snafu)]
 pub enum HealthcheckError {
     #[snafu(display("Unexpected status: {}", status))]

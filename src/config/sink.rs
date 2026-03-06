@@ -458,72 +458,67 @@ impl From<UriSerde> for SinkHealthcheckOptions {
     }
 }
 
-/// Generalized interface for describing and building sink components.
+/// Generalized interface for sink configuration and construction.
+///
+/// Each sink type implements this trait to declare accepted input, optional
+/// resource constraints, acknowledgement behavior, and runtime construction.
 #[async_trait]
 #[typetag::serde(tag = "type")]
 pub trait SinkConfig: DynClone + NamedComponent + core::fmt::Debug + Send + Sync {
-    /// Builds the sink with the given context.
-    ///
-    /// If the sink is built successfully, `Ok(...)` is returned containing the sink and the sink's
-    /// healthcheck.
+    /// Build the sink with the given context.
     ///
     /// # Errors
     ///
-    /// If an error occurs while building the sink, an error variant explaining the issue is
-    /// returned.
+    /// Returns an error if the sink cannot be constructed.
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)>;
 
-    /// Gets the input configuration for this sink.
+    /// Input requirements used for topology validation.
     fn input(&self) -> Input;
 
-    /// Gets the files to watch to trigger reload
+    /// Files to watch for reload triggers.
     fn files_to_watch(&self) -> Vec<&PathBuf> {
         Vec::new()
     }
 
-    /// Gets the list of resources, if any, used by this sink.
+    /// Runtime resources claimed by this sink (ports, disk buffers, and so on).
     ///
-    /// Resources represent dependencies -- network ports, file descriptors, and so on -- that
-    /// cannot be shared between components at runtime. This ensures that components can not be
-    /// configured in a way that would deadlock the spawning of a topology, and as well, allows
-    /// Vector to determine the correct order for rebuilding a topology during configuration reload
-    /// when resources must first be reclaimed before being reassigned, and so on.
-    ///
-    /// # Disk Buffers as Resources
-    ///
-    /// Sinks with disk buffers claim a `DiskBuffer` resource. This prevents two sinks from
-    /// writing to the same buffer file, which would corrupt data:
-    ///
-    /// ```rust,ignore
-    /// fn resources(&self, id: &ComponentKey) -> Vec<Resource> {
-    ///     let mut resources = self.inner.resources();
-    ///     if let Some(disk_buffer) = &self.buffer.disk {
-    ///         resources.push(Resource::DiskBuffer(id.to_string()));
-    ///     }
-    ///     resources
-    /// }
-    /// ```
-    ///
-    /// The resource ID is the component key, so each sink gets its own buffer file.
+    /// Resource tracking prevents conflicting configurations and informs
+    /// topology rebuild ordering during reload.
     fn resources(&self) -> Vec<Resource> {
         Vec::new()
     }
 
-    /// Gets the acknowledgements configuration for this sink.
+    /// Acknowledgement settings for this sink.
     fn acknowledgements(&self) -> &AcknowledgementsConfig;
 }
 
 dyn_clone::clone_trait_object!(SinkConfig);
 
+/// Runtime context provided to sinks during `SinkConfig::build`.
 #[derive(Clone, Debug)]
 pub struct SinkContext {
+    /// Healthcheck options.
     pub healthcheck: SinkHealthcheckOptions,
+
+    /// Global Vector options.
     pub globals: GlobalOptions,
+
+    /// Enrichment tables shared across components.
     pub enrichment_tables: vector_lib::enrichment::TableRegistry,
+
+    /// Storage for VRL program metrics.
     pub metrics_storage: MetricsStorage,
+
+    /// Proxy configuration.
     pub proxy: ProxyConfig,
+
+    /// Schema options used by components.
     pub schema: schema::Options,
+
+    /// Application name used by components.
     pub app_name: String,
+
+    /// Slugified application name.
     pub app_name_slug: String,
 
     /// Extra context data provided by the running app and shared across all components. This can be

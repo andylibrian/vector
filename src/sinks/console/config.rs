@@ -1,3 +1,8 @@
+//! Configuration for the `console` sink.
+//!
+//! The console sink writes encoded events to `stdout` or `stderr`, primarily for
+//! local debugging and simple pipelines.
+
 use futures::{FutureExt, future};
 use tokio::io;
 use vector_lib::{
@@ -22,13 +27,13 @@ use crate::{
 #[derivative(Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Target {
-    /// Write output to [STDOUT][stdout].
+    /// Write output to [stdout][stdout].
     ///
     /// [stdout]: https://en.wikipedia.org/wiki/Standard_streams#Standard_output_(stdout)
     #[derivative(Default)]
     Stdout,
 
-    /// Write output to [STDERR][stderr].
+    /// Write output to [stderr][stderr].
     ///
     /// [stderr]: https://en.wikipedia.org/wiki/Standard_streams#Standard_error_(stderr)
     Stderr,
@@ -42,13 +47,16 @@ pub enum Target {
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct ConsoleSinkConfig {
+    /// Output target stream.
     #[configurable(derived)]
     #[serde(default = "default_target")]
     pub target: Target,
 
+    /// Encoding and transform settings.
     #[serde(flatten)]
     pub encoding: EncodingConfigWithFraming,
 
+    /// Acknowledgement configuration.
     #[configurable(derived)]
     #[serde(
         default,
@@ -94,6 +102,7 @@ impl SinkConfig for ConsoleSinkConfig {
             }),
         };
 
+        // Console has no external dependency to probe at startup.
         Ok((sink, future::ok(()).boxed()))
     }
 
